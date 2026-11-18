@@ -1,0 +1,269 @@
+package io.washy.sm8750.tuner
+
+import android.app.Application
+import android.os.PowerManager
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+internal enum class Operation { READING, WRITING_CDT, REBOOTING, LOADING }
+
+internal enum class RebootPrompt { ENABLED_CDT, RESTORED_CDT }
+
+internal data class CorePreset(val label: String, val cores: Set<Int>)
+
+internal val CORE_PRESETS = listOf(
+    CorePreset("全核 0–7", (0..7).toSet()),
+    CorePreset("双大核 6–7", setOf(6, 7)),
+    CorePreset("中/小核 0–5", (0..5).toSet()),
+    CorePreset("单核 CPU6", setOf(6)),
+)
+
+internal data class LiveFreqSample(
+    val domain: Int,
+    val currentKhz: Int,
+    val effectiveMinKhz: Int,
+    val effectiveMaxKhz: Int,
+)
+
+internal data class ScreenState(
+    val plan: DevicePlan? = null,
+    val operation: Operation? = null,
+    val status: String? = null,
+    val loadPhaseElapsedSec: Int = 0,
+    val error: String? = null,
+    val rebootPrompt: RebootPrompt? = null,
+    val pendingRestoreNoBackup: Boolean = false,
+    val cores: Set<Int> = (0..7).toSet(),
+    val threads: String = "8",
+    val seconds: String = "15",
+    val frequencyMode: FrequencyMode = FrequencyMode.MAX,
+    val workload: WorkloadKind = WorkloadKind.FP,
+    val fixedFrequencies: Map<Int, Int> = emptyMap(),
+    val liveFrequencies: Map<Int, LiveFreqSample> = emptyMap(),
+    val lastRun: LoadRun? = null,
+) {
+    val config: LoadConfig?
+        get() {
+            val threadCount = threads.toIntOrNull() ?: return null
+            val duration = seconds.toIntOrNull() ?: return null
+            val domains = cores.map(::domainFor).toSet()
+            val targets = if (frequencyMode == FrequencyMode.FIXED) domains.mapNotNull { domain ->
+                val levels = plan?.current.orEmpty().filter { it.domain == domain }
+                val selected = fixedFrequencies[domain]?.takeIf { khz -> levels.any { it.khz == khz } }
+                    ?: levels.maxOfOrNull { it.khz }
+                selected?.let { domain to it }
+            }.toMap() else emptyMap()
+            return LoadConfig(cores, threadCount, duration, frequencyMode, targets, workload).takeIf { it.valid }
+        }
+}
+
+internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
+    private val backend = RootBackend(app)
+    private val thermal = app.getSystemService(PowerManager::class.java)
+    private val _state = MutableStateFlow(ScreenState())
+    val state = _state.asStateFlow()
+    private var control: LoadControl? = null
+
+    init {
+        refresh()
+    }
+
+    fun refresh() = launchOperation(Operation.READING, "正在读取 CDT 分区与电压计划…") {
+        updatePlan(backend.read())
+    }
+
+    fun enableCdt() {
+        val plan = _state.value.plan ?: return
+        if (plan.state == PlanState.CORRUPT_CDT || plan.cdtDisk == "slt_enabled") return
+        launchOperation(Operation.WRITING_CDT, "正在备份原厂 CDT 并写入 Key 7 = 1…") {
+            val updated = backend.enableCdt(plan.bootId)
+            updatePlan(updated)
+            if (updated.state == PlanState.CDT_PENDING_REBOOT) {
+                _state.update { it.copy(rebootPrompt = RebootPrompt.ENABLED_CDT) }
+            }
+        }
+    }
+
+    fun restoreCdt(fallbackClean: Boolean = false) {
+        val plan = _state.value.plan ?: return
+        if (plan.cdtDisk != "slt_enabled" && !plan.hasCdtBackup && plan.state != PlanState.EXTERNAL_RUNTIME) return
+        _state.update { it.copy(pendingRestoreNoBackup = false) }
+        launchOperation(Operation.WRITING_CDT, "正在还原 CDT 分区并逐字节校验…") {
+            try {
+                val updated = backend.restoreCdt(plan.bootId, fallbackClean)
+                updatePlan(updated)
+                if (updated.state == PlanState.RESTORE_PENDING_REBOOT || updated.state == PlanState.EXTERNAL_RUNTIME) {
+                    _state.update { it.copy(rebootPrompt = RebootPrompt.RESTORED_CDT) }
+                }
+            } catch (_: MissingCdtBackupException) {
+                _state.update { it.copy(pendingRestoreNoBackup = true) }
+            }
+        }
+    }
+
+    fun dismissRestoreNoBackup() = _state.update { it.copy(pendingRestoreNoBackup = false) }
+
+    fun dismissRebootPrompt() = _state.update { it.copy(rebootPrompt = null) }
+
+    fun rebootNow() {
+        val plan = _state.value.plan ?: return
+        _state.update { it.copy(rebootPrompt = null) }
+        launchOperation(Operation.REBOOTING, "正在重启设备…") {
+            backend.reboot(plan.bootId)
+        }
+    }
+
+    fun applyPreset(cores: Set<Int>) = _state.update { state ->
+        if (state.operation != null) return@update state
+        val available = cores.intersect(state.plan?.online.orEmpty())
+        if (available.isEmpty()) return@update state
+        state.copy(cores = available, threads = available.size.toString())
+    }
+
+    fun toggleCore(core: Int) = _state.update { state ->
+        if (state.operation != null || core !in state.plan?.online.orEmpty()) return@update state
+        val selected = if (core in state.cores) state.cores - core else state.cores + core
+        val threads = state.threads.toIntOrNull()
+        state.copy(
+            cores = selected,
+            threads = if (threads != null && threads < selected.size) selected.size.toString() else state.threads,
+        )
+    }
+
+    fun setThreads(input: String) = setNumber(input, 2) { state, value -> state.copy(threads = value) }
+
+    fun setSeconds(input: String) = setNumber(input, 4) { state, value -> state.copy(seconds = value) }
+
+    fun setQuickSeconds(sec: Int) = _state.update {
+        if (it.operation == null) it.copy(seconds = sec.toString()) else it
+    }
+
+    fun setFrequencyMode(mode: FrequencyMode) = _state.update {
+        if (it.operation == null) it.copy(frequencyMode = mode) else it
+    }
+
+    fun setWorkload(kind: WorkloadKind) = _state.update {
+        if (it.operation == null) it.copy(workload = kind) else it
+    }
+
+    fun setFixedFrequency(domain: Int, khz: Int) = _state.update {
+        if (it.operation == null) it.copy(fixedFrequencies = it.fixedFrequencies + (domain to khz)) else it
+    }
+
+    private fun setNumber(input: String, digits: Int, change: (ScreenState, String) -> ScreenState) {
+        if (input.length <= digits && input.all { it in '0'..'9' }) {
+            _state.update { if (it.operation == null) change(it, input) else it }
+        }
+    }
+
+    fun startLoad() {
+        val snapshot = _state.value
+        val device = snapshot.plan ?: return
+        val config = snapshot.config ?: return
+        if (!device.online.containsAll(config.cores)) return
+        launchOperation(Operation.LOADING, "正在准备压测…") {
+            val session = LoadControl()
+            control = session
+            var firstDomainObserved: Int? = null
+            var ticks = 0
+            try {
+                val fresh = backend.read()
+                updatePlan(fresh)
+                check(
+                    fresh.bootId == device.bootId && fresh.state == device.state &&
+                        fresh.current == device.current && fresh.online.containsAll(config.cores),
+                ) { "电压计划或在线核心已变化，请刷新后重试" }
+                val thermalStart = thermal?.currentThermalStatus
+                val stats = backend.runLoad(fresh, config, session) { line ->
+                    when (line) {
+                        "RUNNING" -> {
+                            ticks = 0
+                            _state.update {
+                                val hint = if (config.seconds >= 6) " · 同步采 PVC" else ""
+                                it.copy(status = "正在压测 ${config.workload.label}$hint", loadPhaseElapsedSec = 0)
+                            }
+                        }
+                        else -> if (line.startsWith("PROGRESS ")) {
+                            val fields = line.split(' ')
+                            val domain = domainFor(fields[1].toInt())
+                            val current = fields[2].toInt()
+                            val minimum = fields[4].toInt()
+                            val maximum = fields[5].toInt()
+                            if (firstDomainObserved == null) firstDomainObserved = domain
+                            if (domain == firstDomainObserved) ticks += 1
+                            _state.update {
+                                it.copy(
+                                    loadPhaseElapsedSec = ticks.coerceAtMost(config.seconds),
+                                    liveFrequencies = it.liveFrequencies +
+                                        (domain to LiveFreqSample(domain, current, minimum, maximum)),
+                                )
+                            }
+                        }
+                    }
+                } ?: return@launchOperation
+                val thermalEnd = thermal?.currentThermalStatus
+                val after = backend.read()
+                updatePlan(after)
+                check(
+                    after.bootId == fresh.bootId && after.current == fresh.current &&
+                        after.state == fresh.state && after.online.containsAll(config.cores),
+                ) { "压测期间电压计划或在线核心发生变化，结果未保留" }
+                val run = LoadRun(config, fresh.current, stats, thermalStart, thermalEnd)
+                _state.update { it.copy(lastRun = run) }
+            } finally {
+                control = null
+            }
+        }
+    }
+
+    fun stopLoad() {
+        val session = control ?: return
+        viewModelScope.launch(Dispatchers.IO) { session.stop() }
+    }
+
+    override fun onCleared() {
+        control?.stop()
+    }
+
+    private fun updatePlan(plan: DevicePlan) = _state.update {
+        val sameBoot = it.plan?.bootId == plan.bootId
+        val cores = it.cores.intersect(plan.online)
+        it.copy(
+            plan = plan,
+            cores = cores.ifEmpty { setOfNotNull(plan.online.firstOrNull()) },
+            lastRun = it.lastRun.takeIf { run -> sameBoot && run?.plan == plan.current },
+        )
+    }
+
+    private fun launchOperation(operation: Operation, status: String, block: suspend () -> Unit) {
+        if (_state.value.operation != null) return
+        _state.update {
+            it.copy(
+                operation = operation,
+                status = status,
+                loadPhaseElapsedSec = 0,
+                error = null,
+            )
+        }
+        viewModelScope.launch {
+            try {
+                block()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (operation == Operation.READING) _state.update { it.copy(plan = null) }
+                _state.update { it.copy(error = e.message ?: "操作失败") }
+            } finally {
+                _state.update {
+                    it.copy(operation = null, status = null, loadPhaseElapsedSec = 0, liveFrequencies = emptyMap())
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,88 @@
+import java.util.Properties
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "io.washy.sm8750.tuner"
+    compileSdk = 36
+    ndkVersion = "27.3.13750724"
+
+    defaultConfig {
+        applicationId = "io.washy.sm8750.tuner"
+        minSdk = 30
+        targetSdk = 36
+        versionCode = 4
+        versionName = "0.4.0beta"
+    }
+
+    buildFeatures {
+        compose = true
+    }
+}
+
+val local = Properties().apply {
+    rootProject.file("local.properties").takeIf { it.isFile }?.inputStream()?.use { load(it) }
+}
+val ndk = providers.environmentVariable("ANDROID_NDK_HOME").orElse(
+    provider {
+        val sdk = local.getProperty("sdk.dir") ?: System.getenv("ANDROID_HOME")
+            ?: System.getenv("ANDROID_SDK_ROOT") ?: error("Set sdk.dir or ANDROID_HOME.")
+        "$sdk/ndk/${android.ndkVersion}"
+    },
+)
+val generatedAssets = layout.buildDirectory.dir("generated/tuner-assets")
+val backendModules = listOf(
+    "kernel/sm8750_acd_observer.ko",
+    "kernel/sm8750_scmi_plan_ro.ko",
+    "kernel/sm8750_pvc_corr_ro.ko",
+    "kernel/sm8750_stress_qos.ko",
+).map(rootProject::file)
+val generateBackend by tasks.registering(Sync::class) {
+    from(backendModules)
+    into(generatedAssets.map { it.dir("backend") })
+    doFirst {
+        backendModules.forEach { check(it.isFile) { "Missing kernel module: $it" } }
+    }
+}
+val generatedNativeAssets = layout.buildDirectory.dir("generated/tuner-native-assets")
+fun registerNativeBinary(taskName: String, sourcePath: String, assetName: String, extraFlags: List<String> = emptyList(), extraSources: List<String> = emptyList()) =
+    tasks.register<Exec>(taskName) {
+        val sources = (listOf(sourcePath) + extraSources).map(::file)
+        val binary = generatedNativeAssets.map { it.file("backend/$assetName") }
+        inputs.files(sources)
+        inputs.property("ndkPath", ndk)
+        outputs.file(binary)
+        doFirst {
+            val toolchains = file("${ndk.get()}/toolchains/llvm/prebuilt")
+            val host = toolchains.listFiles()?.singleOrNull { it.isDirectory }
+                ?: error("Install NDK ${android.ndkVersion} or set ANDROID_NDK_HOME.")
+            binary.get().asFile.parentFile.mkdirs()
+            val clang = host.resolve("bin/clang" + if (System.getProperty("os.name").startsWith("Windows")) ".exe" else "")
+            commandLine(
+                listOf(
+                    clang.absolutePath, "--target=aarch64-linux-android30", "-std=c17",
+                    "-O3", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie", "-Wl,-z,max-page-size=16384",
+                ) + extraFlags + sources.map { it.absolutePath } + listOf("-o", binary.get().asFile.absolutePath),
+            )
+        }
+    }
+val buildLoadWorker = registerNativeBinary(
+    "buildLoadWorker", "src/main/cpp/load.c", "load", listOf("-pthread"),
+    listOf("src/main/cpp/openblas/sgemm_kernel_16x4.S"),
+)
+val buildCdtTool = registerNativeBinary("buildCdtTool", "src/main/cpp/cdt_tool.c", "cdt_tool")
+android.sourceSets["main"].assets.directories.addAll(listOf(generatedAssets.get().asFile.path, generatedNativeAssets.get().asFile.path))
+tasks.named("preBuild") { dependsOn(generateBackend, buildLoadWorker, buildCdtTool) }
+
+dependencies {
+    implementation(platform("androidx.compose:compose-bom:2026.03.00"))
+    implementation("androidx.activity:activity-compose:1.12.4")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.10.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+}
