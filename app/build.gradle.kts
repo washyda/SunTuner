@@ -18,6 +18,18 @@ android {
         versionName = "0.4.0beta"
     }
 
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+
+            ndk {
+                abiFilters += "arm64-v8a"
+            }
+        }
+    }
+
     buildFeatures {
         compose = true
     }
