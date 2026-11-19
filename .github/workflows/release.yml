@@ -61,7 +61,6 @@ jobs:
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
       - name: Verify release tag
-        id: tag
         env:
           TAG: ${{ steps.version.outputs.tag }}
         shell: bash
@@ -74,20 +73,6 @@ jobs:
               echo "::error::$TAG already points to $tagged_source; this run builds $build_source. Choose a new release version."
               exit 1
             fi
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check release credentials for a new tag
-        if: steps.tag.outputs.exists == 'false'
-        env:
-          RELEASE_TOKEN: ${{ secrets.RELEASE_PUBLISH_TOKEN }}
-        shell: bash
-        run: |
-          if [[ -z "$RELEASE_TOKEN" ]]; then
-            echo "::error::Creating a release with a new tag requires RELEASE_PUBLISH_TOKEN in the release environment. Grant the token Contents and Workflows write access to SunTuner."
-            exit 1
           fi
 
       - name: Prepare release notes
@@ -182,7 +167,6 @@ jobs:
       - name: Publish GitHub Release and create version tag
         uses: softprops/action-gh-release@v3
         with:
-          token: ${{ steps.tag.outputs.exists == 'true' && github.token || secrets.RELEASE_PUBLISH_TOKEN }}
           tag_name: ${{ steps.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: SunTuner ${{ steps.version.outputs.version }}
