@@ -37,6 +37,8 @@ Release APK 需签名后安装。仓库包含[内核模块和构建说明](kerne
 
 在 **Actions → Android release → Run workflow** 输入版本号（如 `0.4.0beta`）和递增的 Android `versionCode`。工作流会构建并验证 arm64 APK，再创建 `v<版本号>` tag 和 GitHub Release。也可以先推送 `v*` tag 触发发布。缺少任一签名 Secret 时，发布会失败，不会上传未签名 APK。
 
+发布新标签需要在 `release` 环境中添加 `RELEASE_PUBLISH_TOKEN` Secret。使用仅授权 SunTuner 仓库的细粒度令牌，并授予 **Contents** 和 **Workflows** 读写权限。
+
 本次更新见 [CHANGELOG](CHANGELOG.md)。
 
 SunTuner 自有用户态代码采用 [Apache-2.0](LICENSE)，内核模块采用 [GPL-2.0-only](kernel/COPYING)，OpenBLAS 保留 [BSD-3-Clause 声明](app/src/main/assets/licenses/OpenBLAS.txt)。
