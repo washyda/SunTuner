@@ -1,6 +1,8 @@
 package io.washy.sm8750.tuner
 
 import android.app.Application
+import android.net.Uri
+import android.os.Build
 import android.os.PowerManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -11,7 +13,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-internal enum class Operation { READING, WRITING_CDT, REBOOTING, LOADING }
+internal enum class Operation { READING, EXPORTING_DIAGNOSTICS, WRITING_CDT, REBOOTING, LOADING }
 
 internal enum class RebootPrompt { ENABLED_CDT, RESTORED_CDT }
 
@@ -37,6 +39,7 @@ internal data class ScreenState(
     val status: String? = null,
     val loadPhaseElapsedSec: Int = 0,
     val error: String? = null,
+    val diagnosticsExportComplete: Boolean? = null,
     val rebootPrompt: RebootPrompt? = null,
     val pendingRestoreNoBackup: Boolean = false,
     val cores: Set<Int> = (0..7).toSet(),
@@ -71,12 +74,20 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     private var control: LoadControl? = null
 
     init {
-        refresh()
+        // The legacy refresh loads PJZ110-specific probe modules.
+        if (Build.MODEL.equals("PJZ110", ignoreCase = true)) refresh()
     }
 
     fun refresh() = launchOperation(Operation.READING, "正在读取 CDT 分区与电压计划…") {
         updatePlan(backend.read())
     }
+
+    fun exportDiagnostics(destination: Uri) = launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在导出适配诊断…") {
+        val complete = backend.exportDiagnostics(destination)
+        _state.update { it.copy(diagnosticsExportComplete = complete) }
+    }
+
+    fun dismissDiagnosticsResult() = _state.update { it.copy(diagnosticsExportComplete = null) }
 
     fun enableCdt() {
         val plan = _state.value.plan ?: return

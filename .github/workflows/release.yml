@@ -1,0 +1,129 @@
+name: Android release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix (for example 0.4.0beta)
+        required: true
+        type: string
+      version_code:
+        description: Android versionCode (must increase for every release)
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Select release version
+        id: version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_VERSION_CODE: ${{ inputs.version_code }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            version="$INPUT_VERSION"
+            version_code="$INPUT_VERSION_CODE"
+          else
+            version="${REF_NAME#v}"
+            version_code="$(sed -n 's/.*releaseVersionCode").orElse("\([0-9][0-9]*\)").get().toInt().*/\1/p' app/build.gradle.kts | head -n1)"
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*$ ]] || { echo "Invalid release version: $version" >&2; exit 1; }
+          [[ "$version_code" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid Android versionCode: $version_code" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK and NDK
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.3.13750724"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build arm64 release APK
+        run: >-
+          ./gradlew --no-daemon :app:assembleRelease
+          -PreleaseVersionName=${{ steps.version.outputs.version }}
+          -PreleaseVersionCode=${{ steps.version.outputs.version_code }}
+
+      - name: Sign and verify release APK
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in RELEASE_KEYSTORE_BASE64 RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD RELEASE_STORE_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required GitHub Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+
+          unsigned="app/build/outputs/apk/release/app-release-unsigned.apk"
+          signed="app/build/outputs/apk/release/SunTuner-${VERSION}-release.apk"
+          keystore="$RUNNER_TEMP/suntuner-release.p12"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          trap 'rm -f "$keystore"' EXIT
+
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign \
+            --ks "$keystore" \
+            --ks-key-alias "$RELEASE_KEY_ALIAS" \
+            --ks-pass "env:RELEASE_STORE_PASSWORD" \
+            --key-pass "env:RELEASE_KEY_PASSWORD" \
+            --out "$signed" "$unsigned"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$signed"
+          rm -f "$unsigned"
+          echo "RELEASE_APK=$signed" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release and create version tag
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: SunTuner ${{ steps.version.outputs.version }}
+          body: |
+            ## 更新内容
+            - 新增 Log 按钮，可查询并导出 CDT、内核版本、CPU 调频策略及相关消费链路诊断信息。
+            - 日志导出会过滤敏感字段，并限制日志内容范围。
+            - 精简发布包，仅包含 arm64-v8a。
+
+            ## 安装
+            下载并安装下方签名的 APK。使用前请确认设备和 CDT 兼容性。
+          files: ${{ env.RELEASE_APK }}
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          prerelease: ${{ contains(steps.version.outputs.version, 'beta') }}

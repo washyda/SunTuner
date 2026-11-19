@@ -1,8 +1,12 @@
 package io.washy.sm8750.tuner
 
 import android.content.Context
+import android.net.Uri
+import android.os.Build
+import android.system.Os
 import java.io.File
 import java.io.OutputStream
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -61,6 +65,37 @@ internal class RootBackend(private val context: Context) {
     }
 
     suspend fun read(): DevicePlan = parsePlan(command(listOf("read")))
+
+    suspend fun exportDiagnostics(destination: Uri): Boolean = withContext(Dispatchers.IO) {
+        val rootReport = try {
+            command(listOf("diagnostics"))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+        val output = context.contentResolver.openOutputStream(destination, "wt")
+            ?: error("无法打开诊断报告")
+        output.bufferedWriter(Charsets.UTF_8).use { writer ->
+            writer.appendLine("SunTuner compatibility report v1")
+            writer.appendLine("MODEL=${Build.MODEL}")
+            writer.appendLine("MANUFACTURER=${Build.MANUFACTURER}")
+            writer.appendLine("DEVICE=${Build.DEVICE}")
+            writer.appendLine("PRODUCT=${Build.PRODUCT}")
+            writer.appendLine("BOARD=${Build.BOARD}")
+            writer.appendLine("ANDROID_RELEASE=${Build.VERSION.RELEASE}")
+            writer.appendLine("FIRMWARE_FINGERPRINT=${Build.FINGERPRINT}")
+            writer.appendLine("KERNEL=${Os.uname().release}")
+            writer.appendLine("ABIS=${Build.SUPPORTED_ABIS.joinToString(",")}")
+            writer.appendLine()
+            if (rootReport != null) {
+                writer.append(rootReport)
+            } else {
+                writer.appendLine("ROOT_PROBE=unavailable (check Root authorization and retry)")
+            }
+        }
+        rootReport != null
+    }
 
     suspend fun enableCdt(bootId: String): DevicePlan =
         parsePlan(command(listOf("cdt_enable", bootId)))

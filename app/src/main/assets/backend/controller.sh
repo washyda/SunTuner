@@ -380,6 +380,105 @@ run_pvc_sampler() {
     parse_pvc_dmesg "$prev_t0" > "$out_file"
 }
 
+print_diagnostic_log() {
+    awk '
+        {
+            line = tolower($0)
+            if (line ~ /serial|imei|meid|mac[ _-]*addr|keybox|androidboot[.]/) next
+            if (line !~ /boot_cdt_init|(^|[^[:alnum:]_])cdt([^[:alnum:]_]|$)|platform id:|platform[[:space:]]*:|platforminfo|calibrationdxe|calibration (done|start)|calcomp|(^|[^[:alnum:]_])(slt|acd|apns)([^[:alnum:]_]|$)/) next
+            gsub(/[[:cntrl:]]/, " ")
+            print substr($0, 1, 420)
+            if (++count == 100) {
+                print "[log excerpt limited to 100 lines]"
+                exit
+            }
+        }
+        END { if (!count) print "[no matching entries]" }
+    '
+}
+
+collect_diagnostics() {
+    local cdt_dev path prop value attribute policy
+    printf '[boot and kernel]\n'
+    printf 'KERNEL_RELEASE=%s\n' "$(uname -r)"
+    for prop in ro.boot.slot_suffix ro.boot.slot ro.boot.hardware ro.product.vendor.device         ro.vendor.build.fingerprint ro.soc.manufacturer ro.soc.model; do
+        value=$(getprop "$prop")
+        [ -z "$value" ] || printf '%s=%s\n' "$prop" "$value"
+    done
+
+    printf '\n[cdt partition]\n'
+    if cdt_dev=$(find_cdt_dev) && [ -b "$cdt_dev" ]; then
+        path=$(readlink -f "$cdt_dev") || path=unknown
+        printf 'CDT_DEV=%s\nCDT_BLOCK=%s\n' "$cdt_dev" "$path"
+        value=$(blockdev --getsize64 "$cdt_dev" 2>/dev/null) || value=unknown
+        printf 'CDT_PARTITION_BYTES=%s\n' "$value"
+        if cp "$bundle/cdt_tool" "$work/cdt_tool" 2>/dev/null && chmod 700 "$work/cdt_tool" 2>/dev/null &&
+            "$work/cdt_tool" backup "$cdt_dev" "$work/cdt.bin" 2>/dev/null &&
+            "$work/cdt_tool" status "$work/cdt.bin" > "$work/cdt.status" 2>/dev/null; then
+            value=$(sha256sum "$work/cdt.bin") || value=unknown
+            printf 'CDT_SHA256=%s\n' "${value%% *}"
+            sed '/^CDT_DEV=/d' "$work/cdt.status"
+            printf 'BOOT_CDT is a boot-log heuristic, not proof that SLT/ACD ran.\n'
+        else
+            printf 'CDT_READ=unavailable (read or parser failed)\n'
+        fi
+    else
+        printf 'CDT_READ=partition_not_found\n'
+    fi
+
+    printf '\n[cpu and scmi]\n'
+    value=$(cat "$cpu/online" 2>/dev/null) || value=unknown
+    printf 'CPU_ONLINE=%s\n' "$value"
+    for policy in "$cpu"/cpufreq/policy*; do
+        [ -d "$policy" ] || continue
+        for attribute in related_cpus scaling_driver scaling_available_frequencies; do
+            value=$(cat "$policy/$attribute" 2>/dev/null) || continue
+            printf '%s.%s=%s\n' "${policy##*/}" "$attribute" "$value"
+        done
+    done
+    if [ -d /sys/bus/scmi_protocol ]; then
+        printf 'SCMI_BUS=present\n'
+        for path in /sys/bus/scmi_protocol/devices/*; do
+            [ -e "$path" ] || continue
+            value=$(cat "$path/modalias" 2>/dev/null) || continue
+            printf 'SCMI_DEVICE=%s %s\n' "${path##*/}" "$value"
+        done
+    else
+        printf 'SCMI_BUS=unavailable\n'
+    fi
+
+    printf '\n[bootloader log excerpt]\n'
+    if head -c 262144 /proc/bootloader_log > "$work/boot.log" 2>/dev/null; then
+        if grep -iq 'SLT Platform Key not found' "$work/boot.log"; then
+            printf 'SLT_KEY_LOOKUP=not_found\n'
+        else
+            printf 'SLT_KEY_LOOKUP=not_confirmed_by_log\n'
+        fi
+        print_diagnostic_log < "$work/boot.log"
+    else
+        printf '[bootloader_log unavailable]\n'
+    fi
+    printf '\n[kernel log excerpt]\n'
+    if dmesg > "$work/kernel.log" 2>/dev/null; then
+        print_diagnostic_log < "$work/kernel.log"
+    else
+        printf '[kernel log unavailable]\n'
+    fi
+}
+
+if [ "$action" = diagnostics ]; then
+    [ "$#" = 0 ] || die "诊断参数无效"
+    [ "$(id -u)" = 0 ] || die "需要 Root 权限"
+    mkdir -p "$root"
+    exec 9>"$root/lock"
+    flock -n 9 9>&9 || die "有另一个降压或烤机任务正在运行"
+    work=$(mktemp -d "$root/diagnostics.XXXXXXXX")
+    trap 'rm -rf -- "$work"' EXIT
+    trap 'exit 143' TERM HUP INT
+    collect_diagnostics
+    exit 0
+fi
+
 check_firmware
 mkdir -p "$root" "$persistent"
 exec 9>"$root/lock"

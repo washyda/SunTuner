@@ -44,6 +44,7 @@ import io.washy.sm8750.tuner.ScreenState
 internal fun VoltageScreen(
     state: ScreenState,
     onRefresh: () -> Unit,
+    onExportDiagnostics: () -> Unit,
     onEnableCdt: () -> Unit,
     onRestoreCdt: () -> Unit,
     onRebootNow: () -> Unit,
@@ -84,6 +85,7 @@ internal fun VoltageScreen(
                 device = device,
                 busy = state.operation != null,
                 onRefresh = onRefresh,
+                onExportDiagnostics = onExportDiagnostics,
                 onAskEnable = { confirmEnable = true },
                 onAskRestore = { confirmRestore = true },
                 onRebootNow = onRebootNow,
@@ -139,14 +141,20 @@ private fun CdtActions(
     device: DevicePlan?,
     busy: Boolean,
     onRefresh: () -> Unit,
+    onExportDiagnostics: () -> Unit,
     onAskEnable: () -> Unit,
     onAskRestore: () -> Unit,
     onRebootNow: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        device?.let {
-            val (label, tone) = planStateTag(it.state)
-            StatusPill(label, tone)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.weight(1f)) {
+                device?.let {
+                    val (label, tone) = planStateTag(it.state)
+                    StatusPill(label, tone)
+                }
+            }
+            TextButton(onClick = onExportDiagnostics, enabled = !busy) { Text("Log") }
         }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             when (device?.state) {
@@ -181,7 +189,7 @@ private fun VoltageScreenPreview() {
     TunerTheme {
         VoltageScreen(
             state = ScreenState(),
-            onRefresh = {}, onEnableCdt = {}, onRestoreCdt = {}, onRebootNow = {},
+            onRefresh = {}, onExportDiagnostics = {}, onEnableCdt = {}, onRestoreCdt = {}, onRebootNow = {},
         )
     }
 }

@@ -26,4 +26,17 @@ SunTuner 改走原厂启动校准流程。从原厂状态首次开启时，App �
 
 Release APK 需签名后安装。仓库包含[内核模块和构建说明](kernel/README.md)。
 
+## GitHub 自动发布
+
+在 **Settings → Environments** 创建名为 `release` 的 Environment，建议设置 Required reviewers；再将以下值添加为该 Environment 的 Secrets。不要把密钥提交到仓库、写进 Gradle 配置或放在普通 Actions 变量里：
+
+- `RELEASE_KEYSTORE_BASE64`：PKCS12 keystore 文件的 Base64 内容
+- `RELEASE_KEY_ALIAS`：签名别名
+- `RELEASE_STORE_PASSWORD`：keystore 密码
+- `RELEASE_KEY_PASSWORD`：签名密钥密码
+
+在 **Actions → Android release → Run workflow** 输入版本号（如 `0.4.0beta`）和递增的 Android `versionCode`。工作流会构建并验证 arm64 APK，再创建 `v<版本号>` tag 和 GitHub Release。也可以先推送 `v*` tag 触发发布。缺少任一签名 Secret 时，发布会失败，不会上传未签名 APK。
+
+本次更新见 [CHANGELOG](CHANGELOG.md)。
+
 SunTuner 自有用户态代码采用 [Apache-2.0](LICENSE)，内核模块采用 [GPL-2.0-only](kernel/COPYING)，OpenBLAS 保留 [BSD-3-Clause 声明](app/src/main/assets/licenses/OpenBLAS.txt)。

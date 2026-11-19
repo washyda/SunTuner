@@ -3,6 +3,8 @@ package io.washy.sm8750.tuner
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
@@ -59,6 +61,9 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             val state by model.state.collectAsStateWithLifecycle()
+            val diagnosticsPicker = rememberLauncherForActivityResult(
+                ActivityResultContracts.CreateDocument("text/plain"),
+            ) { uri -> uri?.let(model::exportDiagnostics) }
             LaunchedEffect(state.operation) {
                 if (state.operation == Operation.LOADING || state.operation == Operation.WRITING_CDT) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -70,6 +75,11 @@ class MainActivity : ComponentActivity() {
                 TunerApp(
                     state = state,
                     onRefresh = model::refresh,
+                    onExportDiagnostics = {
+                        val modelName = android.os.Build.MODEL.replace(Regex("[^A-Za-z0-9_-]"), "_").take(40)
+                        diagnosticsPicker.launch("SunTuner-$modelName-diagnostics.txt")
+                    },
+                    onDismissDiagnosticsResult = model::dismissDiagnosticsResult,
                     onEnableCdt = model::enableCdt,
                     onRestoreCdt = { model.restoreCdt(fallbackClean = false) },
                     onRestoreFallbackClean = { model.restoreCdt(fallbackClean = true) },
@@ -102,6 +112,8 @@ class MainActivity : ComponentActivity() {
 private fun TunerApp(
     state: ScreenState,
     onRefresh: () -> Unit,
+    onExportDiagnostics: () -> Unit,
+    onDismissDiagnosticsResult: () -> Unit,
     onEnableCdt: () -> Unit,
     onRestoreCdt: () -> Unit,
     onRestoreFallbackClean: () -> Unit,
@@ -120,6 +132,18 @@ private fun TunerApp(
     onStop: () -> Unit,
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
+
+    state.diagnosticsExportComplete?.let { complete ->
+        AlertDialog(
+            onDismissRequest = onDismissDiagnosticsResult,
+            title = { Text("诊断报告已保存") },
+            text = {
+                Text(if (complete) "可把导出的文本发给开发者核对适配情况。"
+                    else "报告已保存机型、固件和内核信息。Root 采集失败，授权后可重新导出。")
+            },
+            confirmButton = { TextButton(onClick = onDismissDiagnosticsResult) { Text("完成") } },
+        )
+    }
 
     state.rebootPrompt?.let { prompt ->
         val title = if (prompt == RebootPrompt.ENABLED_CDT) "CDT 写入成功" else "CDT 还原成功"
@@ -158,6 +182,7 @@ private fun TunerApp(
                             StatusPill(label, tone, Modifier.padding(end = 4.dp))
                         }
                         TextButton(enabled = state.operation == null, onClick = onRefresh) { Text("刷新") }
+                        TextButton(enabled = state.operation == null, onClick = onExportDiagnostics) { Text("Log") }
                     },
                 )
             }
@@ -210,6 +235,7 @@ private fun TunerApp(
                     VoltageScreen(
                         state = state,
                         onRefresh = onRefresh,
+                        onExportDiagnostics = onExportDiagnostics,
                         onEnableCdt = onEnableCdt,
                         onRestoreCdt = onRestoreCdt,
                         onRebootNow = onRebootNow,
@@ -290,7 +316,7 @@ private fun TunerPreview() {
     TunerTheme {
         TunerApp(
             state = ScreenState(),
-            onRefresh = {}, onEnableCdt = {}, onRestoreCdt = {}, onRestoreFallbackClean = {},
+            onRefresh = {}, onExportDiagnostics = {}, onDismissDiagnosticsResult = {}, onEnableCdt = {}, onRestoreCdt = {}, onRestoreFallbackClean = {},
             onDismissRestoreNoBackup = {}, onRebootNow = {}, onDismissReboot = {},
             onPreset = {}, onCore = {}, onThreads = {}, onSeconds = {}, onQuickSeconds = {},
             onMode = {}, onWorkload = {}, onFrequency = { _, _ -> }, onStart = {}, onStop = {},
