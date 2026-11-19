@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2beta
 
 - 新增兼容性检测结果页，可查看 Root、CDT、SCMI 和 SELinux 状态，并重复保存同一份诊断报告。
 - 诊断报告加入 CDT 块设备和父设备的只读标记，以及仍保留的内核、SELinux 和 BBG 写入拒绝记录，无需试刷即可采集。
