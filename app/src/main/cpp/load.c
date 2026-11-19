@@ -21,15 +21,16 @@ enum {
     CORE_COUNT = 8,
     MAX_THREADS = 32,
     POINTS = 16,
-    BATCH = 4096,
-    LANES = 8,
-    INT_OPS_PER_ITER = 4,
-    FP_ROWS = 16,
-    FP_COLUMNS = 4,
-    FP_DEPTH = 512,
-    FP_PRODUCTS_PER_BATCH = FP_ROWS * FP_COLUMNS * FP_DEPTH,
-    // One initial multiply, 511 FMAs and one final alpha FMA per output.
-    FP_FLOPS_PER_BATCH = FP_ROWS * FP_COLUMNS * (1 + 2 * FP_DEPTH),
+    INT_LANES = 16,
+    INT_BATCH = 2048,
+    INT_OPS_PER_ITER = 16,
+    INT_OPS_PER_BATCH = INT_BATCH * INT_LANES * INT_OPS_PER_ITER,
+    FP_ROWS = 64,
+    FP_COLUMNS = 64,
+    FP_DEPTH = 128,
+    FP_SUB_ITERS = 16,
+    FP_PRODUCTS_PER_BATCH = FP_ROWS * FP_COLUMNS * FP_DEPTH * FP_SUB_ITERS,
+    FP_FLOPS_PER_BATCH = 2 * FP_ROWS * FP_COLUMNS * FP_DEPTH * FP_SUB_ITERS,
     STEP_POLL_MS = 500,
 };
 enum workload_kind { WORKLOAD_INT = 0, WORKLOAD_FP = 1, WORKLOAD_MIXED = 2 };
@@ -124,51 +125,71 @@ static void add_perf_delta(const struct perf_sample *before, const struct perf_s
     }
 }
 
-static void run_int_batch(uint64_t x[restrict LANES]) {
-    for (unsigned i = 0; i < BATCH; ++i) {
-        for (unsigned lane = 0; lane < LANES; ++lane) {
-            uint64_t word = x[lane];
-            word ^= word >> 12;
-            word ^= word << 25;
-            word ^= word >> 27;
-            x[lane] = word * UINT64_C(2685821657736338717);
+static void run_int_batch(uint64_t x[restrict INT_LANES], uint64_t y[restrict INT_LANES]) {
+    for (unsigned i = 0; i < INT_BATCH; ++i) {
+        #pragma clang loop unroll(enable)
+        for (unsigned lane = 0; lane < INT_LANES; ++lane) {
+            uint64_t a = x[lane];
+            uint64_t b = y[lane];
+            a += b;
+            b ^= a;
+            a = (a >> 3) ^ (a << 61);
+            b = (b << 5) | (b >> 59);
+            b -= a;
+            a ^= UINT64_C(0xf0f0f0f0f0f0f0f0);
+            b ^= UINT64_C(0x1000100010001000);
+            a *= 3;
+            b *= 7;
+            a += (a / 77);
+            b -= (b / 3);
+            a ^= (a >> 17);
+            b ^= (b << 23);
+            a = a * UINT64_C(6364136223846793005) + 1;
+            b = b * UINT64_C(1442695040888963407) + 1;
+            x[lane] = a;
+            y[lane] = b;
         }
     }
 }
 
 struct fp_work {
     _Alignas(64) float a[FP_ROWS * FP_DEPTH];
-    _Alignas(64) float b[FP_COLUMNS * FP_DEPTH];
+    _Alignas(64) float b[FP_DEPTH * FP_COLUMNS];
     _Alignas(64) float expected[FP_ROWS * FP_COLUMNS];
+    _Alignas(64) float output[FP_ROWS * FP_COLUMNS];
 };
 
 static void prepare_fp_work(struct fp_work *fp, unsigned core) {
-    // OpenBLAS packs one column of A and one row of B per K step.
-    // Binary fractions keep every product and partial sum exact in FP32.
-    for (unsigned k = 0; k < FP_DEPTH; ++k) {
-        for (unsigned row = 0; row < FP_ROWS; ++row) {
-            fp->a[k * FP_ROWS + row] = (1 + (k * 3 + row + core) % 31) / 32.0f;
-        }
-        for (unsigned col = 0; col < FP_COLUMNS; ++col) {
-            fp->b[k * FP_COLUMNS + col] = (1 + (k + col * 7) % 29) / 32.0f;
-        }
+    for (unsigned i = 0; i < FP_ROWS * FP_DEPTH; ++i) {
+        fp->a[i] = (float)((i + core) % 17) / 16.0f;
     }
+    for (unsigned i = 0; i < FP_DEPTH * FP_COLUMNS; ++i) {
+        fp->b[i] = (float)((i + core) % 13) / 16.0f;
+    }
+    // The kernel packs A in 16-row panels and B in 4-column panels.
+    // Binary fractions keep the products and all accumulated sums exact.
     for (unsigned col = 0; col < FP_COLUMNS; ++col) {
         for (unsigned row = 0; row < FP_ROWS; ++row) {
             float sum = 0.0f;
             for (unsigned k = 0; k < FP_DEPTH; ++k) {
-                sum += fp->a[k * FP_ROWS + row] * fp->b[k * FP_COLUMNS + col];
+                unsigned a = (row / 16 * FP_DEPTH + k) * 16 + row % 16;
+                unsigned b = (col / 4 * FP_DEPTH + k) * 4 + col % 4;
+                sum += fp->a[a] * fp->b[b];
             }
-            fp->expected[col * FP_ROWS + row] = sum;
+            fp->expected[col * FP_ROWS + row] = sum * FP_SUB_ITERS;
         }
     }
 }
 
-static bool run_fp_batch(const struct fp_work *fp) {
-    _Alignas(64) float output[FP_ROWS * FP_COLUMNS] = {0};
-    return sm8750_sgemm_kernel(FP_ROWS, FP_COLUMNS, FP_DEPTH, 1.0f,
-                               fp->a, fp->b, output, FP_ROWS) == 0 &&
-           memcmp(output, fp->expected, sizeof(output)) == 0;
+static bool run_fp_batch(struct fp_work *fp) {
+    memset(fp->output, 0, sizeof(fp->output));
+    for (int iter = 0; iter < FP_SUB_ITERS; ++iter) {
+        if (sm8750_sgemm_kernel(FP_ROWS, FP_COLUMNS, FP_DEPTH, 1.0f,
+                                fp->a, fp->b, fp->output, FP_ROWS) != 0) {
+            return false;
+        }
+    }
+    return memcmp(fp->output, fp->expected, sizeof(fp->output)) == 0;
 }
 
 static void *load_core(void *arg) {
@@ -189,9 +210,10 @@ static void *load_core(void *arg) {
     pthread_mutex_unlock(&gate);
 
     if (worker->affinity_error) return NULL;
-    uint64_t x[LANES];
-    for (unsigned lane = 0; lane < LANES; ++lane) {
-        x[lane] = UINT64_C(0x839587471c) + worker->core * 17U + lane;
+    uint64_t x[INT_LANES], y[INT_LANES];
+    for (unsigned lane = 0; lane < INT_LANES; ++lane) {
+        x[lane] = UINT64_C(0x839587471c) + worker->core * 101U + lane * 31U;
+        y[lane] = UINT64_C(0xfedcba0987654321) - worker->core * 73U - lane * 17U;
     }
 
     if (counter >= 0 && ioctl(counter, PERF_EVENT_IOC_ENABLE, 0) == -1) {
@@ -211,9 +233,9 @@ static void *load_core(void *arg) {
         uint64_t b = 0;
         if (kind == WORKLOAD_INT) {
             do {
-                run_int_batch(x);
+                run_int_batch(x, y);
                 ++b;
-                if ((b & 31) == 0 && sched_getcpu() != (int) worker->core) {
+                if ((b & 127) == 0 && sched_getcpu() != (int) worker->core) {
                     atomic_store(&affinity_lost, true);
                     break;
                 }
@@ -259,8 +281,8 @@ static void *load_core(void *arg) {
         close(counter);
     }
     uint64_t cs = 0;
-    for (unsigned lane = 0; lane < LANES; ++lane) {
-        cs ^= x[lane];
+    for (unsigned lane = 0; lane < INT_LANES; ++lane) {
+        cs ^= (x[lane] ^ y[lane]);
     }
     worker->checksum = cs;
     return NULL;
@@ -497,12 +519,12 @@ int main(int argc, char *argv[]) {
             bool have_cycles = true, have_int_cycles = (int_wall_ns > 0), have_fp_cycles = (fp_wall_ns > 0);
             for (unsigned j = i; j < created; j += cores) {
                 busy += workers[j].cpu_ns;
-                work += workers[j].int_batches * BATCH * LANES + workers[j].fp_batches * FP_PRODUCTS_PER_BATCH;
+                work += workers[j].int_batches * INT_BATCH * INT_LANES + workers[j].fp_batches * FP_PRODUCTS_PER_BATCH;
                 checksum ^= workers[j].checksum;
                 cycles += workers[j].cycles;
                 if (!workers[j].cycles) have_cycles = false;
                 int_ns += workers[j].int_ns;
-                int_ops += workers[j].int_batches * BATCH * LANES * INT_OPS_PER_ITER;
+                int_ops += workers[j].int_batches * INT_OPS_PER_BATCH;
                 int_cycles += workers[j].int_cycles;
                 if (int_wall_ns > 0 && !workers[j].int_cycles) have_int_cycles = false;
                 fp_ns += workers[j].fp_ns;

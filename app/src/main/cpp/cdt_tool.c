@@ -71,10 +71,10 @@ static void write_u16_le(uint8_t *p, uint16_t v) {
     p[1] = (uint8_t)((v >> 8) & 0xffu);
 }
 
-static int read_entire_fd(int fd, uint8_t **out_buf, size_t *out_len) {
+static int read_entire_fd(int fd, uint8_t **out_buf, size_t *out_len, size_t max_len) {
     off_t end = lseek(fd, 0, SEEK_END);
     if (end < 0) return -1;
-    if (end < CDT_MIN_PART_SIZE || end > CDT_MAX_PART_SIZE) {
+    if (end < CDT_MIN_PART_SIZE || (uintmax_t)end > max_len) {
         errno = EINVAL;
         return -1;
     }
@@ -102,13 +102,23 @@ static int read_entire_fd(int fd, uint8_t **out_buf, size_t *out_len) {
     return 0;
 }
 
-static int read_file_exact(const char *path, uint8_t **out_buf, size_t *out_len) {
+static int read_file(const char *path, uint8_t **out_buf, size_t *out_len, size_t max_len) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
-    int rc = read_entire_fd(fd, out_buf, out_len);
+    int rc = read_entire_fd(fd, out_buf, out_len, max_len);
     int saved = errno;
     close(fd);
     errno = saved;
+    return rc;
+}
+
+static int read_file_exact(const char *path, uint8_t **out_buf, size_t *out_len) {
+    return read_file(path, out_buf, out_len, CDT_MAX_PART_SIZE);
+}
+
+static int sync_fd(int fd) {
+    int rc;
+    do { rc = fsync(fd); } while (rc < 0 && errno == EINTR);
     return rc;
 }
 
@@ -116,16 +126,39 @@ static int write_all_fd(int fd, const uint8_t *buf, size_t len) {
     size_t done = 0;
     while (done < len) {
         ssize_t n = write(fd, buf + done, len - done);
-        if (n < 0) {
-            if (errno == EINTR) continue;
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            int saved = n == 0 ? EIO : errno;
+            fprintf(stderr, "CDT_STEP=write_failed bytes=%zu/%zu errno=%d (%s)\n",
+                    done, len, saved, strerror(saved));
+            errno = saved;
             return -1;
         }
         done += (size_t)n;
     }
-    return fsync(fd) == 0 ? 0 : -1;
+    int rc = sync_fd(fd);
+    if (rc != 0) {
+        int saved = errno;
+        fprintf(stderr, "CDT_STEP=fsync_failed bytes=%zu errno=%d (%s)\n",
+                len, saved, strerror(saved));
+        errno = saved;
+    }
+    return rc;
 }
 
-static int write_block_and_verify(const char *path, const uint8_t *buf, size_t len) {
+static void invalidate_block_cache(int fd) {
+#ifdef BLKFLSBUF
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)) {
+        (void)ioctl(fd, BLKFLSBUF);
+    }
+#else
+    (void)fd;
+#endif
+}
+
+static int write_block(const char *path, const uint8_t *buf, size_t len, int *attempted) {
+    *attempted = 0;
     int fd = open(path, O_RDWR);
     if (fd < 0) return -1;
     off_t end = lseek(fd, 0, SEEK_END);
@@ -134,30 +167,45 @@ static int write_block_and_verify(const char *path, const uint8_t *buf, size_t l
         errno = EINVAL;
         return -1;
     }
+    *attempted = 1;
     if (write_all_fd(fd, buf, len) != 0) {
         int saved = errno;
         close(fd);
         errno = saved;
         return -1;
     }
-#ifdef BLKFLSBUF
-    struct stat st;
-    if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)) {
-        (void)ioctl(fd, BLKFLSBUF);
-    }
-#endif
-    close(fd);
+    invalidate_block_cache(fd);
+    return close(fd);
+}
 
-    uint8_t *verify = NULL;
-    size_t verify_len = 0;
-    if (read_file_exact(path, &verify, &verify_len) != 0) return -1;
-    int match = (verify_len == len && memcmp(buf, verify, len) == 0);
-    free(verify);
-    if (!match) {
-        errno = EIO;
-        return -1;
+/* A fresh open and a full comparison distinguish a committed image from a
+ * partial write. Retry read errors and mismatches before deciding to roll back. */
+static int image_matches(const char *path, const uint8_t *buf, size_t len) {
+    for (int i = 0; i < 3; i++) {
+        uint8_t *verify = NULL;
+        size_t verify_len = 0;
+        if (read_file_exact(path, &verify, &verify_len) == 0) {
+            int match = verify_len == len && memcmp(buf, verify, len) == 0;
+            free(verify);
+            if (match) return 1;
+            errno = EIO;
+        }
     }
     return 0;
+}
+
+static int sync_block(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+    int rc = sync_fd(fd);
+    int saved = errno;
+    if (rc == 0) {
+        invalidate_block_cache(fd);
+        return close(fd);
+    }
+    close(fd);
+    errno = saved;
+    return -1;
 }
 
 static int save_backup_atomic(const char *backup_path, const uint8_t *buf, size_t len) {
@@ -169,7 +217,7 @@ static int save_backup_atomic(const char *backup_path, const uint8_t *buf, size_
     }
     int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return -1;
-    if (write_all_fd(fd, buf, len) != 0 || fsync(fd) != 0) {
+    if (write_all_fd(fd, buf, len) != 0) {
         int saved = errno;
         close(fd);
         unlink(tmp_path);
@@ -189,6 +237,138 @@ static int save_backup_atomic(const char *backup_path, const uint8_t *buf, size_
         return -1;
     }
     return 0;
+}
+
+static int transaction_path(const char *backup_path, char *path, size_t size) {
+    int n = snprintf(path, size, "%s.transaction", backup_path);
+    if (n < 0 || (size_t)n >= size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int sync_parent(const char *path) {
+    char dir[1024];
+    const char *slash = strrchr(path, '/');
+    size_t len = slash ? (size_t)(slash - path) : 0;
+    if (len == 0) {
+        strcpy(dir, slash ? "/" : ".");
+    } else {
+        memcpy(dir, path, len);
+        dir[len] = '\0';
+    }
+    int fd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return -1;
+    int rc = sync_fd(fd);
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return rc;
+}
+
+static void finish_transaction(const char *journal) {
+    if (unlink(journal) != 0 || sync_parent(journal) != 0)
+        fprintf(stderr, "CDT_INFO=journal_cleanup_failed: %s\n", strerror(errno));
+}
+
+static const char *operation_result = "unchanged";
+
+static int restore_previous(const char *device, const uint8_t *previous, size_t len) {
+    if (image_matches(device, previous, len) && sync_block(device) == 0 &&
+        image_matches(device, previous, len)) return 0;
+    for (int i = 0; i < 3; i++) {
+        fprintf(stderr, "CDT_STEP=rollback_write attempt=%d\n", i + 1);
+        int attempted;
+        int rc = write_block(device, previous, len, &attempted);
+        if ((rc == 0 || sync_block(device) == 0) && image_matches(device, previous, len))
+            return 0;
+    }
+    return -1;
+}
+
+static int recover_transaction(const char *device, const char *backup_path) {
+    char journal[1024];
+    uint8_t *record = NULL, *current = NULL;
+    size_t size = 0, len = 0;
+    if (transaction_path(backup_path, journal, sizeof(journal)) != 0) goto failed;
+    if (read_file(journal, &record, &size, 2 * CDT_MAX_PART_SIZE) != 0) {
+        if (errno == ENOENT) return 0;
+        goto failed;
+    }
+    if (read_file_exact(device, &current, &len) != 0) goto failed;
+    if (size != 2 * len) { errno = EINVAL; goto failed; }
+
+    // A completed write can outlive the process that was supposed to report it.
+    if (memcmp(current, record + len, len) == 0) {
+        if (sync_block(device) == 0 && image_matches(device, record + len, len)) {
+            printf("CDT_RECOVERY=target_verified\n");
+            goto complete;
+        }
+    } else {
+        // Do not overwrite an unrelated image installed outside the app.
+        for (size_t i = 0; i < len; i++) {
+            if (current[i] != record[i] && current[i] != record[len + i]) {
+                errno = EINVAL;
+                goto failed;
+            }
+        }
+    }
+    if (restore_previous(device, record, len) != 0) goto failed;
+    printf("CDT_RECOVERY=previous_verified\n");
+complete:
+    finish_transaction(journal);
+    free(current);
+    free(record);
+    return 0;
+failed:
+    operation_result = "unknown";
+    fprintf(stderr, "CDT_ERR=recovery_failed: %s\n", strerror(errno));
+    free(current);
+    free(record);
+    return -1;
+}
+
+static int replace_cdt(const char *device, const char *backup_path,
+                       const uint8_t *previous, const uint8_t *target, size_t len) {
+    fprintf(stderr, "CDT_STEP=prepare_journal image_bytes=%zu\n", len);
+    char journal[1024];
+    if (transaction_path(backup_path, journal, sizeof(journal)) != 0) return -1;
+    uint8_t *record = malloc(2 * len);
+    if (!record) return -1;
+    memcpy(record, previous, len);
+    memcpy(record + len, target, len);
+    int rc = save_backup_atomic(journal, record, 2 * len);
+    free(record);
+    if (rc != 0 || sync_parent(journal) != 0) return -1;
+
+    int attempted;
+    fprintf(stderr, "CDT_STEP=write_target\n");
+    rc = write_block(device, target, len, &attempted);
+    int write_error = rc == 0 ? EIO : errno;
+    if (rc != 0) {
+        fprintf(stderr, "CDT_STEP=target_write_error attempted=%d errno=%d (%s)\n",
+                attempted, write_error, strerror(write_error));
+    }
+    if (attempted) fprintf(stderr, "CDT_STEP=verify_target\n");
+    if (attempted && image_matches(device, target, len) &&
+        (rc == 0 || (sync_block(device) == 0 && image_matches(device, target, len)))) {
+        finish_transaction(journal);
+        fprintf(stderr, "CDT_STEP=target_verified\n");
+        if (rc != 0) fprintf(stderr, "CDT_INFO=commit_reconciled\n");
+        return 0;
+    }
+    if (attempted) fprintf(stderr, "CDT_STEP=verify_target_failed; checking rollback\n");
+    if (!attempted || restore_previous(device, previous, len) == 0) {
+        finish_transaction(journal);
+        operation_result = attempted ? "rolled_back" : "unchanged";
+        fprintf(stderr, "CDT_ERR=%s\n", operation_result);
+    } else {
+        operation_result = "unknown";
+        fprintf(stderr, "CDT_ERR=rollback_failed: %s\n", strerror(errno));
+    }
+    errno = write_error;
+    return -1;
 }
 
 static int parse_cdt(const uint8_t *buf, size_t len, cdt_parsed_t *out) {
@@ -512,23 +692,50 @@ static const char *disk_state_str(disk_state_t s) {
     }
 }
 
-static int cmd_status(const char *dev_path) {
-    uint8_t *buf = NULL;
-    size_t len = 0;
-    if (read_file_exact(dev_path, &buf, &len) != 0) {
-        fprintf(stderr, "cdt_tool: read %s failed: %s\n", dev_path, strerror(errno));
-        return 1;
+static const char *backup_status(const char *path, const uint8_t *current, size_t len) {
+    uint8_t *backup = NULL;
+    size_t backup_len = 0;
+    if (!path) return "missing";
+    if (read_file_exact(path, &backup, &backup_len) != 0)
+        return errno == ENOENT ? "missing" : "invalid";
+
+    cdt_parsed_t parsed;
+    const char *status = "invalid";
+    if (backup_len == len && parse_cdt(backup, backup_len, &parsed) == 0 &&
+        (parsed.state == DISK_EMPTY || parsed.state == DISK_STOCK)) {
+        status = "mismatch";
+        if (memcmp(current, backup, len) == 0) {
+            status = "match";
+        } else {
+            cdt_parsed_t active;
+            if (parse_cdt(current, len, &active) == 0 &&
+                active.state == DISK_SLT_ENABLED && active.key7_val == 1) {
+                platform_hint_t hint = {0};
+                if (parsed.state == DISK_EMPTY) {
+                    detect_boot_cdt_state(&hint);
+                    if (!hint.present) {
+                        hint = (platform_hint_t){1, active.version, active.platform_id, active.major,
+                                                 active.minor, active.subtype, active.fusion};
+                    }
+                }
+                uint8_t *expected = NULL;
+                if (build_cdt_with_key7(backup, len, &parsed, &hint, 1, 1, &expected) == 0) {
+                    if (memcmp(current, expected, len) == 0) status = "enabled_match";
+                    free(expected);
+                }
+            }
+        }
     }
+    free(backup);
+    return status;
+}
+
+static void print_disk_status(const uint8_t *buf, size_t len, const char *original_status) {
     cdt_parsed_t parsed;
     parse_cdt(buf, len, &parsed);
-    free(buf);
-
-    platform_hint_t hint;
-    const char *boot_state = detect_boot_cdt_state(&hint);
-
-    printf("CDT_DEV=%s\n", dev_path);
     printf("CDT_SIZE=%zu\n", len);
     printf("CDT_DISK=%s\n", disk_state_str(parsed.state));
+    printf("CDT_BACKUP_STATUS=%s\n", original_status);
     if (parsed.has_key7) {
         printf("CDT_KEY7=%u\n", parsed.key7_val);
     } else {
@@ -551,6 +758,21 @@ static int cmd_status(const char *dev_path) {
         printf("CDT_PLATFORM=none\n");
         printf("CDT_KEYS=none\n");
     }
+}
+
+static int cmd_status(const char *dev_path, const char *backup_path) {
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    if (read_file_exact(dev_path, &buf, &len) != 0) {
+        fprintf(stderr, "cdt_tool: read %s failed: %s\n", dev_path, strerror(errno));
+        return 1;
+    }
+    printf("CDT_DEV=%s\n", dev_path);
+    print_disk_status(buf, len, backup_status(backup_path, buf, len));
+    free(buf);
+
+    platform_hint_t hint;
+    const char *boot_state = detect_boot_cdt_state(&hint);
     printf("BOOT_CDT=%s\n", boot_state);
     if (hint.present) {
         printf("BOOT_PLATFORM_INFO=%u,%u,%u,%u,%u,%u\n",
@@ -566,6 +788,7 @@ static int cmd_enable_with_hint(
     const char *backup_path,
     const platform_hint_t *override_hint
 ) {
+    if (recover_transaction(dev_path, backup_path) != 0) return 5;
     uint8_t *buf = NULL;
     size_t len = 0;
     if (read_file_exact(dev_path, &buf, &len) != 0) {
@@ -579,20 +802,28 @@ static int cmd_enable_with_hint(
         return 2;
     }
 
+    const char *original = backup_status(backup_path, buf, len);
+    if (strcmp(original, "mismatch") == 0 || strcmp(original, "invalid") == 0) {
+        free(buf);
+        fprintf(stderr, "CDT_ERR=backup_%s\n", original);
+        return 3;
+    }
     if (parsed.state == DISK_SLT_ENABLED && parsed.key7_val == 1) {
+        print_disk_status(buf, len, original);
         free(buf);
         printf("CDT_ACTION=already_enabled\n");
         return 0;
     }
 
     /* Persist original unmodified partition ONCE; never overwrite with a Key7!=0 image. */
-    if (access(backup_path, F_OK) != 0 && parsed.state != DISK_SLT_ENABLED) {
+    if (strcmp(original, "missing") == 0 && parsed.state != DISK_SLT_ENABLED) {
         if (save_backup_atomic(backup_path, buf, len) != 0) {
             free(buf);
             fprintf(stderr, "cdt_tool: failed to save original CDT backup %s: %s\n",
                     backup_path, strerror(errno));
             return 3;
         }
+        original = "match";
     }
 
     platform_hint_t detected;
@@ -612,13 +843,15 @@ static int cmd_enable_with_hint(
         }
         return 4;
     }
+    int rc = replace_cdt(dev_path, backup_path, buf, new_img, len);
+    int saved = errno;
     free(buf);
-
-    if (write_block_and_verify(dev_path, new_img, len) != 0) {
+    if (rc != 0) {
         free(new_img);
-        fprintf(stderr, "cdt_tool: write & verify %s failed: %s\n", dev_path, strerror(errno));
+        fprintf(stderr, "cdt_tool: write & verify %s failed: %s\n", dev_path, strerror(saved));
         return 5;
     }
+    print_disk_status(new_img, len, strcmp(original, "match") == 0 ? "enabled_match" : original);
     free(new_img);
     printf("CDT_ACTION=enabled_verified\n");
     return 0;
@@ -630,6 +863,7 @@ static int cmd_restore_with_hint(
     int allow_fallback_clean,
     const platform_hint_t *override_hint
 ) {
+    if (recover_transaction(dev_path, backup_path) != 0) return 5;
     uint8_t *cur = NULL;
     size_t cur_len = 0;
     if (read_file_exact(dev_path, &cur, &cur_len) != 0) {
@@ -647,23 +881,27 @@ static int cmd_restore_with_hint(
             return 2;
         }
         cdt_parsed_t bak_parsed;
-        if (parse_cdt(bak, bak_len, &bak_parsed) != 0 || bak_parsed.state == DISK_SLT_ENABLED) {
+        if (parse_cdt(bak, bak_len, &bak_parsed) != 0 ||
+            (bak_parsed.state != DISK_EMPTY && bak_parsed.state != DISK_STOCK)) {
             free(bak);
             free(cur);
             fprintf(stderr, "cdt_tool: backup %s is corrupt or not stock\n", backup_path);
             return 3;
         }
         if (memcmp(cur, bak, cur_len) == 0) {
+            print_disk_status(cur, cur_len, "match");
             free(bak);
             free(cur);
             printf("CDT_ACTION=already_restored\n");
             return 0;
         }
-        int rc = write_block_and_verify(dev_path, bak, cur_len);
+        int rc = replace_cdt(dev_path, backup_path, cur, bak, cur_len);
+        int saved = errno;
+        if (rc == 0) print_disk_status(bak, cur_len, "match");
         free(bak);
         free(cur);
         if (rc != 0) {
-            fprintf(stderr, "cdt_tool: restore write/verify failed: %s\n", strerror(errno));
+            fprintf(stderr, "cdt_tool: restore write/verify failed: %s\n", strerror(saved));
             return 4;
         }
         printf("CDT_ACTION=restored_from_backup\n");
@@ -683,6 +921,7 @@ static int cmd_restore_with_hint(
         return 3;
     }
     if (cur_parsed.state != DISK_SLT_ENABLED) {
+        print_disk_status(cur, cur_len, "missing");
         free(cur);
         printf("CDT_ACTION=already_restored\n");
         return 0;
@@ -700,12 +939,15 @@ static int cmd_restore_with_hint(
         fprintf(stderr, "cdt_tool: failed to build clean stock image\n");
         return 4;
     }
+    int rc = replace_cdt(dev_path, backup_path, cur, clean_img, cur_len);
+    int saved = errno;
     free(cur);
-    if (write_block_and_verify(dev_path, clean_img, cur_len) != 0) {
+    if (rc != 0) {
         free(clean_img);
-        fprintf(stderr, "cdt_tool: clean restore write/verify failed\n");
+        fprintf(stderr, "cdt_tool: clean restore write/verify failed: %s\n", strerror(saved));
         return 5;
     }
+    print_disk_status(clean_img, cur_len, "missing");
     free(clean_img);
     printf("CDT_ACTION=restored_clean_fallback\n");
     return 0;
@@ -856,19 +1098,26 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "selftest") == 0) {
         return cmd_selftest();
     }
-    if (argc == 3 && strcmp(argv[1], "status") == 0) {
-        return cmd_status(argv[2]);
+    if ((argc == 3 || argc == 4) && strcmp(argv[1], "status") == 0) {
+        return cmd_status(argv[2], argc == 4 ? argv[3] : NULL);
     }
     if (argc == 4 && strcmp(argv[1], "backup") == 0) {
         return cmd_backup(argv[2], argv[3]);
     }
+    if (argc == 4 && strcmp(argv[1], "recover") == 0) {
+        return recover_transaction(argv[2], argv[3]) != 0;
+    }
     if (argc == 4 && strcmp(argv[1], "enable") == 0) {
-        return cmd_enable_with_hint(argv[2], argv[3], NULL);
+        int rc = cmd_enable_with_hint(argv[2], argv[3], NULL);
+        printf("CDT_RESULT=%s\n", rc == 0 ? "verified" : operation_result);
+        return rc;
     }
     if ((argc == 4 || (argc == 5 && strcmp(argv[4], "--fallback-clean") == 0)) &&
         strcmp(argv[1], "restore") == 0) {
-        return cmd_restore_with_hint(argv[2], argv[3], argc == 5, NULL);
+        int rc = cmd_restore_with_hint(argv[2], argv[3], argc == 5, NULL);
+        printf("CDT_RESULT=%s\n", rc == 0 ? "verified" : operation_result);
+        return rc;
     }
-    fprintf(stderr, "Usage: cdt_tool status <dev> | backup <dev> <image> | enable <dev> <backup> | restore <dev> <backup> [--fallback-clean] | selftest\n");
+    fprintf(stderr, "Usage: cdt_tool status <dev> [backup] | backup <dev> <image> | recover <dev> <backup> | enable <dev> <backup> | restore <dev> <backup> [--fallback-clean] | selftest\n");
     return 2;
 }

@@ -13,7 +13,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-internal enum class Operation { READING, EXPORTING_DIAGNOSTICS, WRITING_CDT, REBOOTING, LOADING }
+internal enum class Operation { READING, EXPORTING_DIAGNOSTICS, WRITING_CDT, BACKUP_CDT, REBOOTING, LOADING }
 
 internal enum class RebootPrompt { ENABLED_CDT, RESTORED_CDT }
 
@@ -35,11 +35,17 @@ internal data class LiveFreqSample(
 
 internal data class ScreenState(
     val plan: DevicePlan? = null,
+    val cdtPartition: CdtPartition? = null,
+    val cdtUncertain: Boolean = false,
     val operation: Operation? = null,
     val status: String? = null,
     val loadPhaseElapsedSec: Int = 0,
     val error: String? = null,
+    val cdtFailureFeedback: Boolean = false,
+    val hasCdtFailureLog: Boolean = false,
+    val cdtLogExportComplete: Boolean = false,
     val diagnosticsExportComplete: Boolean? = null,
+    val cdtBackupResult: CdtBackupResult? = null,
     val rebootPrompt: RebootPrompt? = null,
     val pendingRestoreNoBackup: Boolean = false,
     val cores: Set<Int> = (0..7).toSet(),
@@ -69,7 +75,7 @@ internal data class ScreenState(
 internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     private val backend = RootBackend(app)
     private val thermal = app.getSystemService(PowerManager::class.java)
-    private val _state = MutableStateFlow(ScreenState())
+    private val _state = MutableStateFlow(ScreenState(hasCdtFailureLog = backend.hasCdtFailureLog))
     val state = _state.asStateFlow()
     private var control: LoadControl? = null
 
@@ -79,7 +85,33 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun refresh() = launchOperation(Operation.READING, "正在读取 CDT 分区与电压计划…") {
-        updatePlan(backend.read())
+        val wasUncertain = _state.value.cdtUncertain
+        val recoveryMessage = try {
+            val recovery = backend.retryCdtRecovery(appendFailureLog = wasUncertain)
+            val partition = backend.readCdtPartition()
+            _state.update {
+                it.copy(cdtPartition = partition, cdtUncertain = false, hasCdtFailureLog = backend.hasCdtFailureLog)
+            }
+            when (recovery) {
+                "previous_verified" -> "已恢复并校验操作前的 CDT。"
+                "target_verified" -> "已确认并校验上次操作的目标 CDT。"
+                else -> null
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            _state.update { it.copy(cdtPartition = null) }
+            throw e
+        }
+        try {
+            updatePlan(backend.read())
+            if (recoveryMessage != null) _state.update { it.copy(error = recoveryMessage) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (recoveryMessage == null) throw e
+            throw IllegalStateException("$recoveryMessage 电压计划读取失败，可稍后刷新。", e)
+        }
     }
 
     fun exportDiagnostics(destination: Uri) = launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在导出适配诊断…") {
@@ -89,32 +121,73 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissDiagnosticsResult() = _state.update { it.copy(diagnosticsExportComplete = null) }
 
+    fun exportCdtFailureLog(destination: Uri) =
+        launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在导出 CDT 刷入日志…") {
+            backend.exportCdtFailureLog(destination)
+            _state.update { it.copy(cdtLogExportComplete = true) }
+        }
+
+    fun dismissCdtLogExportResult() = _state.update { it.copy(cdtLogExportComplete = false) }
+
+    fun backupCdt() = launchOperation(Operation.BACKUP_CDT, "正在备份当前 CDT 分区…") {
+        try {
+            val result = backend.backupCdt()
+            _state.update { it.copy(cdtBackupResult = result) }
+        } catch (t: Throwable) {
+            _state.update { it.copy(error = "CDT 备份失败：${t.message ?: t::class.simpleName}") }
+        }
+    }
+
+    fun dismissCdtBackupResult() = _state.update { it.copy(cdtBackupResult = null) }
+
     fun enableCdt() {
         val plan = _state.value.plan ?: return
-        if (plan.state == PlanState.CORRUPT_CDT || plan.cdtDisk == "slt_enabled") return
+        if (plan.state != PlanState.STOCK_UNMODIFIED && plan.state != PlanState.RESTORE_PENDING_REBOOT) return
+        if (_state.value.cdtUncertain) return
         launchOperation(Operation.WRITING_CDT, "正在备份原厂 CDT 并写入 Key 7 = 1…") {
-            val updated = backend.enableCdt(plan.bootId)
-            updatePlan(updated)
-            if (updated.state == PlanState.CDT_PENDING_REBOOT) {
-                _state.update { it.copy(rebootPrompt = RebootPrompt.ENABLED_CDT) }
-            }
+            applyCdtResult(backend.enableCdt(plan.bootId), RebootPrompt.ENABLED_CDT)
         }
     }
 
     fun restoreCdt(fallbackClean: Boolean = false) {
-        val plan = _state.value.plan ?: return
-        if (plan.cdtDisk != "slt_enabled" && !plan.hasCdtBackup && plan.state != PlanState.EXTERNAL_RUNTIME) return
+        val state = _state.value
+        if (state.cdtUncertain) return
+        val plan = state.plan
+        val partition = state.cdtPartition
+        val bootId = partition?.bootId ?: plan?.bootId ?: return
+        if (partition?.canRestore != true && plan?.cdtDisk != "slt_enabled" &&
+            plan?.hasCdtBackup != true && plan?.state != PlanState.EXTERNAL_RUNTIME) return
         _state.update { it.copy(pendingRestoreNoBackup = false) }
         launchOperation(Operation.WRITING_CDT, "正在还原 CDT 分区并逐字节校验…") {
             try {
-                val updated = backend.restoreCdt(plan.bootId, fallbackClean)
-                updatePlan(updated)
-                if (updated.state == PlanState.RESTORE_PENDING_REBOOT || updated.state == PlanState.EXTERNAL_RUNTIME) {
-                    _state.update { it.copy(rebootPrompt = RebootPrompt.RESTORED_CDT) }
-                }
+                applyCdtResult(backend.restoreCdt(bootId, fallbackClean), RebootPrompt.RESTORED_CDT)
             } catch (_: MissingCdtBackupException) {
                 _state.update { it.copy(pendingRestoreNoBackup = true) }
             }
+        }
+    }
+
+    private fun applyCdtResult(result: CdtOperationResult, success: RebootPrompt) {
+        result.plan?.let(::updatePlan)
+        val planState = result.plan?.state
+        val needsReboot = when (success) {
+            RebootPrompt.ENABLED_CDT -> planState == PlanState.CDT_PENDING_REBOOT
+            RebootPrompt.RESTORED_CDT -> planState == PlanState.RESTORE_PENDING_REBOOT ||
+                planState == PlanState.EXTERNAL_RUNTIME
+        }
+        _state.update {
+            it.copy(
+                plan = result.plan,
+                cdtPartition = result.partition,
+                cdtUncertain = result.outcome == CdtOutcome.UNKNOWN,
+                error = result.message,
+                cdtFailureFeedback = result.message != null && result.logSaved,
+                hasCdtFailureLog = backend.hasCdtFailureLog,
+                rebootPrompt = success.takeIf {
+                    result.outcome == CdtOutcome.VERIFIED &&
+                        (needsReboot || (planState == null && result.partition != null))
+                },
+            )
         }
     }
 
@@ -123,10 +196,12 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     fun dismissRebootPrompt() = _state.update { it.copy(rebootPrompt = null) }
 
     fun rebootNow() {
-        val plan = _state.value.plan ?: return
+        val state = _state.value
+        if (state.cdtUncertain) return
+        val bootId = state.cdtPartition?.bootId ?: state.plan?.bootId ?: return
         _state.update { it.copy(rebootPrompt = null) }
         launchOperation(Operation.REBOOTING, "正在重启设备…") {
-            backend.reboot(plan.bootId)
+            backend.reboot(bootId)
         }
     }
 
@@ -260,6 +335,9 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
                 status = status,
                 loadPhaseElapsedSec = 0,
                 error = null,
+                cdtFailureFeedback = false,
+                hasCdtFailureLog = backend.hasCdtFailureLog,
+                rebootPrompt = if (operation == Operation.WRITING_CDT) null else it.rebootPrompt,
             )
         }
         viewModelScope.launch {
@@ -269,7 +347,13 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
                 throw e
             } catch (e: Exception) {
                 if (operation == Operation.READING) _state.update { it.copy(plan = null) }
-                _state.update { it.copy(error = e.message ?: "操作失败") }
+                _state.update {
+                    it.copy(
+                        error = e.message ?: "操作失败",
+                        cdtFailureFeedback = operation == Operation.READING && backend.hasCdtFailureLog,
+                        hasCdtFailureLog = backend.hasCdtFailureLog,
+                    )
+                }
             } finally {
                 _state.update {
                     it.copy(operation = null, status = null, loadPhaseElapsedSec = 0, liveFrequencies = emptyMap())

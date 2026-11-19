@@ -112,18 +112,18 @@ cleanup() {
             rmmod "$name" || { printf 'ERROR 模块卸载失败 %s\n' "$name" >&2; rc=1; }
         fi
     done
-    [ -z "$work" ] || rm -rf -- "$work"
+    [ -z "$work" ] || rm -rf -- "$work" || rc=1
     exit "$rc"
 }
 
 check_firmware() {
     [ "$(id -u)" = 0 ] || die "需要 Root 权限"
-    [ "$action" != cdt_backup ] || return 0
+    case "$action" in cdt_backup|cdt_status|cdt_recover|cdt_restore) return 0 ;; esac
     [ -d "$cpu/cpufreq/policy0" ] &&
         [ -d "$cpu/cpufreq/policy6" ] ||
         die "缺少 CPU policy0/policy6 调频接口"
     case "$action" in
-        read|cdt_enable|cdt_restore)
+        read|cdt_enable)
             [ -d /sys/bus/scmi_protocol ] || die "缺少 /sys/bus/scmi_protocol 接口" ;;
     esac
 }
@@ -179,25 +179,36 @@ probe_apns_slot() {
 
 inspect_state() {
     cdt_dev=$(find_cdt_dev) || die "未找到 /dev/block/by-name/cdt 分区"
-    "$work/cdt_tool" status "$cdt_dev" > "$work/cdt.status" || die "读取 CDT 分区状态失败"
+    "$work/cdt_tool" status "$cdt_dev" "$persistent/cdt-orig.bin" > "$work/cdt.status" ||
+        die "读取 CDT 分区状态失败"
+    boot_cdt=unknown
+    boot_platform_info=unknown
+    read_cdt_status "$work/cdt.status"
+    probe_apns_slot
+    classify_state
+}
+
+read_cdt_status() {
     cdt_disk=unknown
     cdt_key7=absent
     cdt_platform=none
-    boot_cdt=unknown
-    boot_platform_info=unknown
+    cdt_backup_status=missing
     while IFS='=' read -r k v; do
         case "$k" in
             CDT_DISK) cdt_disk=$v ;;
             CDT_KEY7) cdt_key7=$v ;;
             CDT_PLATFORM) cdt_platform=$v ;;
+            CDT_BACKUP_STATUS) cdt_backup_status=$v ;;
             BOOT_CDT) boot_cdt=$v ;;
             BOOT_PLATFORM_INFO) boot_platform_info=$v ;;
         esac
-    done < "$work/cdt.status"
+    done < "$1"
+}
 
-    probe_apns_slot
-
-    if [ "$cdt_disk" = corrupt ]; then
+classify_state() {
+    if [ "$cdt_backup_status" = mismatch ]; then
+        state=CDT_RECOVERY_REQUIRED
+    elif [ "$cdt_disk" = corrupt ] || [ "$cdt_backup_status" = invalid ]; then
         state=CORRUPT_CDT
     elif [ "$apns_slot" = external ]; then
         state=EXTERNAL_RUNTIME
@@ -212,7 +223,7 @@ inspect_state() {
     fi
 
     has_backup=0
-    [ -f "$persistent/cdt-orig.bin" ] && has_backup=1 || true
+    case "$cdt_backup_status" in match|enabled_match|mismatch) has_backup=1 ;; esac
 }
 
 maybe_persist_stock_baseline() {
@@ -238,10 +249,42 @@ report() {
     inspect_state
     plan > "$work/current"
     maybe_persist_stock_baseline "$work/current"
+    prepare_report
+    emit_report
+}
 
+prepare_report() {
+    online=$(cat "$cpu/online") || die "无法读取在线 CPU"
+    printf '%s\n' "$online" | grep -Eq '^[0-7](-[0-7])?(,[0-7](-[0-7])?)*$' ||
+        die "在线 CPU 状态无效"
+    if [ -f "$persistent/stock-baseline.csv" ]; then
+        cp "$persistent/stock-baseline.csv" "$work/baseline" || die "无法读取原厂电压计划"
+    fi
+}
+
+plan_frequencies() {
+    awk -F, '
+        /^[01],/ {
+            if (NF != 7) exit 1
+            for (i = 1; i <= NF; i++) if ($i !~ /^[0-9]+$/ || $i > 2147483647) exit 1
+            if ($2 != count[$1] || $2 != $7 || $4 <= 0 || $6 <= previous[$1]) exit 1
+            count[$1]++
+            previous[$1] = $6
+            print $1, $2, $6
+        }
+        END { if (count[0] != 16 || count[1] != 16) exit 1 }
+    ' "$1"
+}
+
+capture_cdt_plan() {
+    plan > "$work/current" || die "读取 SCMI 计划失败，未开始写入 CDT"
+    plan_frequencies "$work/current" >"$work/current.freq" || die "SCMI 计划无效，未开始写入 CDT"
+}
+
+emit_report() {
     if [ "$state" = STOCK_UNMODIFIED ]; then
         baseline_source=current_stock
-    elif [ -f "$persistent/stock-baseline.csv" ]; then
+    elif [ -f "$work/baseline" ]; then
         baseline_source=persisted
     else
         baseline_source=none
@@ -249,15 +292,66 @@ report() {
 
     printf 'BOOT %s\nSTATE %s\nCDT_DISK %s\nCDT_KEY7 %s\nCDT_HAS_BACKUP %s\nCDT_PLATFORM %s\nBOOT_CDT %s\nBOOT_PLATFORM_INFO %s\nAPNS_SLOT %s\nONLINE %s\nBASELINE_SOURCE %s\n' \
         "$boot" "$state" "$cdt_disk" "$cdt_key7" "$has_backup" "$cdt_platform" \
-        "$boot_cdt" "$boot_platform_info" "$apns_slot" "$(cat "$cpu/online")" "$baseline_source"
+        "$boot_cdt" "$boot_platform_info" "$apns_slot" "$online" "$baseline_source"
 
     if [ "$baseline_source" = persisted ]; then
         printf 'BEGIN baseline\n'
-        cat "$persistent/stock-baseline.csv"
+        cat "$work/baseline"
     fi
     printf 'BEGIN current\n'
     cat "$work/current"
     printf 'END\n'
+}
+
+cdt_stage() {
+    case "$action" in
+        cdt_enable|cdt_restore) printf 'CDT_STAGE=%s\n' "$1" >&2 ;;
+    esac
+}
+
+cdt_error() {
+    while IFS= read -r detail; do
+        case "$detail" in CDT_ERR=*) printf '%s\n' "$detail" >&2 ;; esac
+        case "$detail" in
+            CDT_STEP=*|CDT_INFO=*) printf '%s\n' "$detail" >&2 ;;
+            CDT_ERR=rolled_back) printf 'ERROR 已恢复并校验操作前的完整 CDT\n' >&2 ;;
+            CDT_ERR=unchanged) printf 'ERROR 写入未开始，CDT 未更改\n' >&2 ;;
+            CDT_ERR=backup_mismatch) printf 'ERROR 当前 CDT 与原厂备份不一致，请先还原分区。\n' >&2 ;;
+            CDT_ERR=backup_invalid) printf 'ERROR 原厂 CDT 备份无效，已停止写入。\n' >&2 ;;
+            CDT_ERR=rollback_failed:*|CDT_ERR=recovery_failed:*)
+                printf 'ERROR 无法确认 CDT 已恢复，恢复记录已保留。请勿重启，先刷新重试恢复。\n' >&2
+                printf 'ERROR %s\n' "$detail" >&2 ;;
+            *) [ -z "$detail" ] || printf 'ERROR %s\n' "$detail" >&2 ;;
+        esac
+    done < "$1"
+    die "$2"
+}
+
+recover_cdt_if_pending() {
+    [ -e "$persistent/cdt-orig.bin.transaction" ] || return 0
+    printf 'CDT_RECOVERY_BEGIN\n'
+    prepare_cdt_tool
+    cdt_dev=$(find_cdt_dev) || die "发现待恢复 CDT，未找到 CDT 分区"
+    "$work/cdt_tool" recover "$cdt_dev" "$persistent/cdt-orig.bin" 2>"$work/recover.err" ||
+        cdt_error "$work/recover.err" "CDT 恢复失败"
+    cat "$work/recover.err" >&2
+}
+
+run_cdt_operation() {
+    verb=$1
+    device=$2
+    shift 2
+    printf 'CDT_OPERATION_BEGIN\n'
+    native_rc=0
+    "$work/cdt_tool" "$verb" "$device" "$persistent/cdt-orig.bin" "$@" >"$work/cdt.out" 2>"$work/cdt.err" || native_rc=$?
+    cat "$work/cdt.out"
+    if [ "$native_rc" -ne 0 ]; then
+        if grep -q '^CDT_ERR=no_backup$' "$work/cdt.err"; then
+            die "CDT_NO_BACKUP 未找到原始 CDT 备份，若需移除 Key 7 恢复出厂请二次确认"
+        fi
+        cdt_error "$work/cdt.err" "CDT 操作失败"
+    fi
+    cat "$work/cdt.err" >&2
 }
 
 prev_pvc_t0_ns() {
@@ -407,6 +501,9 @@ collect_diagnostics() {
     done
 
     printf '\n[cdt partition]\n'
+    if [ -e "$persistent/cdt-orig.bin.transaction" ]; then
+        printf 'CDT_TRANSACTION=pending_recovery\n'
+    fi
     if cdt_dev=$(find_cdt_dev) && [ -b "$cdt_dev" ]; then
         path=$(readlink -f "$cdt_dev") || path=unknown
         printf 'CDT_DEV=%s\nCDT_BLOCK=%s\n' "$cdt_dev" "$path"
@@ -414,7 +511,7 @@ collect_diagnostics() {
         printf 'CDT_PARTITION_BYTES=%s\n' "$value"
         if cp "$bundle/cdt_tool" "$work/cdt_tool" 2>/dev/null && chmod 700 "$work/cdt_tool" 2>/dev/null &&
             "$work/cdt_tool" backup "$cdt_dev" "$work/cdt.bin" 2>/dev/null &&
-            "$work/cdt_tool" status "$work/cdt.bin" > "$work/cdt.status" 2>/dev/null; then
+            "$work/cdt_tool" status "$work/cdt.bin" "$persistent/cdt-orig.bin" > "$work/cdt.status" 2>/dev/null; then
             value=$(sha256sum "$work/cdt.bin") || value=unknown
             printf 'CDT_SHA256=%s\n' "${value%% *}"
             sed '/^CDT_DEV=/d' "$work/cdt.status"
@@ -479,12 +576,14 @@ if [ "$action" = diagnostics ]; then
     exit 0
 fi
 
+cdt_stage check_firmware
 check_firmware
+cdt_stage acquire_lock
 mkdir -p "$root" "$persistent"
 exec 9>"$root/lock"
 flock -n 9 9>&9 || die "有另一个降压或烤机任务正在运行"
 if [ "$action" = cdt_backup ]; then
-    [ "$#" = 0 ] || die "备份参数无效"
+    [ "$#" -le 1 ] || die "备份参数无效"
     cdt_dev=$(find_cdt_dev) || die "未找到 CDT 分区"
     [ -b "$cdt_dev" ] || die "CDT 路径不是块设备"
     work=$(mktemp -d "$root/work.XXXXXXXX")
@@ -493,14 +592,47 @@ if [ "$action" = cdt_backup ]; then
     prepare_cdt_tool
     "$work/cdt_tool" backup "$cdt_dev" "$work/cdt.bin" || die "读取完整 CDT 镜像失败"
     digest=$(sha256sum "$work/cdt.bin") || die "计算备份校验值失败"
-    base64 -w 0 "$work/cdt.bin" > "$work/cdt.base64" || die "编码 CDT 镜像失败"
-    printf 'CDT_SHA256 %s\nCDT_IMAGE ' "${digest%% *}"
-    cat "$work/cdt.base64"
-    printf '\n'
+    dest="${1:-/sdcard/Download/cdt-backup-$(date +%Y%m%d-%H%M%S).img}"
+    mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+    cp "$work/cdt.bin" "$dest" || die "写入备份文件失败"
+    chmod 664 "$dest" 2>/dev/null || true
+    printf 'CDT_BACKUP_PATH %s\n' "$dest"
+    printf 'CDT_SHA256 %s\n' "${digest%% *}"
     exit 0
 fi
 boot=$(cat "$boot_file")
 case "$boot" in ????????-????-????-????-????????????) ;; *) die "无法确认启动 ID" ;; esac
+case "$action" in
+    cdt_status|cdt_recover|cdt_restore)
+        work=$(mktemp -d "$root/work.XXXXXXXX")
+        trap 'rm -rf -- "$work"' EXIT
+        trap 'exit 143' TERM HUP INT
+        trap '' PIPE
+        if [ "$action" = cdt_restore ] || [ "$#" -gt 0 ]; then
+            [ "$#" -ge 1 ] && [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新"
+        fi
+        prepare_cdt_tool
+        cdt_dev=$(find_cdt_dev) || die "未找到 CDT 分区"
+        if [ "$action" = cdt_restore ]; then
+            extra_arg=
+            if [ "$#" = 2 ] && [ "$2" = "--fallback-clean" ]; then
+                extra_arg=--fallback-clean
+            elif [ "$#" -ne 1 ]; then
+                die "还原参数无效"
+            fi
+            recover_cdt_if_pending
+            cdt_stage restore_and_verify
+            run_cdt_operation restore "$cdt_dev" ${extra_arg:+"$extra_arg"}
+        elif [ "$action" = cdt_recover ]; then
+            [ "$#" -le 1 ] || die "恢复参数无效"
+            recover_cdt_if_pending
+        else
+            [ ! -e "$persistent/cdt-orig.bin.transaction" ] || die "CDT 恢复记录尚未处理，请刷新"
+            printf 'BOOT %s\n' "$boot"
+            "$work/cdt_tool" status "$cdt_dev" "$persistent/cdt-orig.bin"
+        fi
+        exit 0 ;;
+esac
 session="$root/session"
 if [ "$(cat "$session/boot" 2>/dev/null || true)" != "$boot" ]; then
     rm -rf -- "$session"
@@ -513,6 +645,9 @@ trap 'exit 143' TERM HUP INT
 trap '' PIPE
 restore_governors || die "无法恢复上次烤机前的调速器"
 restore_frequency_lock || die "无法清理上次烤机的临时频率上限"
+case "$action" in
+    read|cdt_enable|reboot) recover_cdt_if_pending ;;
+esac
 
 case "$action" in
     reboot)
@@ -564,32 +699,18 @@ case "$action" in
         report ;;
     cdt_enable)
         [ "$#" = 1 ] && [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新"
+        cdt_stage prepare_backend
         prepare_cdt_tool
         load_scmi_module
+        cdt_stage inspect_partition
         inspect_state
-        plan > "$work/pre_enable"
-        maybe_persist_stock_baseline "$work/pre_enable"
-        "$work/cdt_tool" enable "$cdt_dev" "$persistent/cdt-orig.bin" >/dev/null ||
-            die "写入并校验 CDT 分区失败"
-        report ;;
-    cdt_restore)
-        [ "$#" -ge 1 ] && [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新"
-        extra_arg=
-        if [ "$#" = 2 ] && [ "$2" = "--fallback-clean" ]; then
-            extra_arg=--fallback-clean
-        elif [ "$#" -ne 1 ]; then
-            die "还原参数无效"
-        fi
-        prepare_cdt_tool
-        load_scmi_module
-        inspect_state
-        if ! "$work/cdt_tool" restore "$cdt_dev" "$persistent/cdt-orig.bin" ${extra_arg:+"$extra_arg"} >"$work/restore.out" 2>"$work/restore.err"; then
-            if grep -q "CDT_ERR=no_backup" "$work/restore.err"; then
-                die "CDT_NO_BACKUP 未找到原始 CDT 备份，若需移除 Key 7 恢复出厂请二次确认"
-            fi
-            cat "$work/restore.err" >&2 || true
-            die "还原 CDT 分区失败"
-        fi
-        report ;;
+        cat "$work/cdt.status" >&2
+        printf 'CDT_PRE_STATE=%s\n' "$state" >&2
+        [ "$state" != CDT_RECOVERY_REQUIRED ] || die "当前 CDT 与原厂备份不一致，请先还原分区"
+        cdt_stage capture_plan
+        capture_cdt_plan
+        maybe_persist_stock_baseline "$work/current"
+        cdt_stage write_and_verify
+        run_cdt_operation enable "$cdt_dev" ;;
     *) die "未知操作" ;;
 esac

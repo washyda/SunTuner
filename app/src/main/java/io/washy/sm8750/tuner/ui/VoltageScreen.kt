@@ -34,7 +34,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.tooling.preview.Preview
-import io.washy.sm8750.tuner.BaselineSource
 import io.washy.sm8750.tuner.DevicePlan
 import io.washy.sm8750.tuner.Level
 import io.washy.sm8750.tuner.PlanState
@@ -45,6 +44,7 @@ internal fun VoltageScreen(
     state: ScreenState,
     onRefresh: () -> Unit,
     onExportDiagnostics: () -> Unit,
+    onBackupCdt: () -> Unit,
     onEnableCdt: () -> Unit,
     onRestoreCdt: () -> Unit,
     onRebootNow: () -> Unit,
@@ -66,11 +66,17 @@ internal fun VoltageScreen(
     }
 
     if (confirmRestore) {
+        val recoveryRequired = device?.state == PlanState.CDT_RECOVERY_REQUIRED
         AlertDialog(
             onDismissRequest = { confirmRestore = false },
-            title = { Text("还原原厂电压") },
-            text = { Text("将恢复 CDT 分区并校验，重启后回到原厂电压。") },
-            confirmButton = { Button(onClick = { confirmRestore = false; onRestoreCdt() }) { Text("还原 CDT") } },
+            title = { Text("还原 CDT 分区") },
+            text = {
+                Text(
+                    if (recoveryRequired) "当前分区与原厂备份不一致。将写回原厂备份并校验整个分区。"
+                    else "将恢复 CDT 分区并校验，重启后回到原厂电压。"
+                )
+            },
+            confirmButton = { Button(onClick = { confirmRestore = false; onRestoreCdt() }) { Text("还原分区") } },
             dismissButton = { TextButton(onClick = { confirmRestore = false }) { Text("取消") } },
         )
     }
@@ -83,9 +89,12 @@ internal fun VoltageScreen(
         item {
             CdtActions(
                 device = device,
+                canRestoreWithoutPlan = state.cdtPartition?.canRestore == true,
+                cdtUncertain = state.cdtUncertain,
                 busy = state.operation != null,
                 onRefresh = onRefresh,
                 onExportDiagnostics = onExportDiagnostics,
+                onBackupCdt = onBackupCdt,
                 onAskEnable = { confirmEnable = true },
                 onAskRestore = { confirmRestore = true },
                 onRebootNow = onRebootNow,
@@ -93,23 +102,9 @@ internal fun VoltageScreen(
         }
         if (device == null) return@LazyColumn
 
-        item { HardwareStatusRow(device) }
-
         val showComparison = device.state == PlanState.CDT_ACTIVE ||
             device.state == PlanState.RESTORE_PENDING_REBOOT ||
             device.state == PlanState.EXTERNAL_RUNTIME
-
-        if (showComparison && device.baseline == null) {
-            item {
-                Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), color = TunerThemeTokens.extended.infoContainer) {
-                    Text(
-                        "开启前未在本应用采样过原厂表，基线列显示 —；还原重启即可采样原厂基线。",
-                        Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-            }
-        }
 
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -139,25 +134,33 @@ internal fun VoltageScreen(
 @Composable
 private fun CdtActions(
     device: DevicePlan?,
+    canRestoreWithoutPlan: Boolean,
+    cdtUncertain: Boolean,
     busy: Boolean,
     onRefresh: () -> Unit,
     onExportDiagnostics: () -> Unit,
+    onBackupCdt: () -> Unit,
     onAskEnable: () -> Unit,
     onAskRestore: () -> Unit,
     onRebootNow: () -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.weight(1f)) {
-                device?.let {
-                    val (label, tone) = planStateTag(it.state)
-                    StatusPill(label, tone)
+                if (cdtUncertain) {
+                    Text("CDT 状态待确认")
+                } else {
+                    device?.let {
+                        val (label, tone) = planStateTag(it.state)
+                        StatusPill(label, tone)
+                    }
                 }
             }
             TextButton(onClick = onExportDiagnostics, enabled = !busy) { Text("Log") }
         }
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            when (device?.state) {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            val availableDevice = device.takeUnless { cdtUncertain }
+            when (availableDevice?.state) {
                 PlanState.STOCK_UNMODIFIED ->
                     Button(onClick = onAskEnable, enabled = !busy) { Text("开启降压") }
                 PlanState.CDT_PENDING_REBOOT -> {
@@ -166,18 +169,25 @@ private fun CdtActions(
                 }
                 PlanState.CDT_ACTIVE ->
                     OutlinedButton(onClick = onAskRestore, enabled = !busy) { Text("还原原厂") }
+                PlanState.CDT_RECOVERY_REQUIRED ->
+                    Button(onClick = onAskRestore, enabled = !busy) { Text("还原分区") }
                 PlanState.RESTORE_PENDING_REBOOT -> {
                     Button(onClick = onRebootNow, enabled = !busy) { Text("立即重启") }
                     OutlinedButton(onClick = onAskEnable, enabled = !busy) { Text("重新开启") }
                 }
                 PlanState.EXTERNAL_RUNTIME -> {
-                    if (device.cdtDisk == "slt_enabled" || device.hasCdtBackup) {
+                    if (availableDevice.cdtDisk == "slt_enabled" || availableDevice.hasCdtBackup) {
                         OutlinedButton(onClick = onAskRestore, enabled = !busy) { Text("还原 CDT") }
                     }
                     Button(onClick = onRebootNow, enabled = !busy) { Text("重启") }
                 }
-                PlanState.CORRUPT_CDT, null -> Unit
+                PlanState.CORRUPT_CDT, null -> {
+                    if (!cdtUncertain && canRestoreWithoutPlan) {
+                        OutlinedButton(onClick = onAskRestore, enabled = !busy) { Text("还原 CDT") }
+                    }
+                }
             }
+            OutlinedButton(onClick = onBackupCdt, enabled = !busy) { Text("备份 CDT") }
             TextButton(onClick = onRefresh, enabled = !busy) { Text("刷新") }
         }
     }
@@ -189,34 +199,8 @@ private fun VoltageScreenPreview() {
     TunerTheme {
         VoltageScreen(
             state = ScreenState(),
-            onRefresh = {}, onExportDiagnostics = {}, onEnableCdt = {}, onRestoreCdt = {}, onRebootNow = {},
+            onRefresh = {}, onExportDiagnostics = {}, onBackupCdt = {}, onEnableCdt = {}, onRestoreCdt = {}, onRebootNow = {},
         )
-    }
-}
-
-@Composable
-private fun HardwareStatusRow(device: DevicePlan) {
-    val diskLabel = when (device.cdtDisk) {
-        "slt_enabled" -> "Key7=1"
-        "empty" -> "原厂空白"
-        "stock" -> "原厂"
-        else -> device.cdtDisk
-    }
-    val bootLabel = when (device.bootCdt) {
-        "applied" -> "已加载"
-        "not_found" -> "未启用"
-        else -> device.bootCdt
-    }
-    val baseLabel = when (device.baselineSource) {
-        BaselineSource.CURRENT_STOCK -> "实时原厂"
-        BaselineSource.PERSISTED -> "已存档"
-        BaselineSource.NONE -> "无"
-    }
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        KeyValuePill("CDT 分区", diskLabel, if (device.cdtDisk == "slt_enabled") Tone.POSITIVE else Tone.NEUTRAL, Modifier.weight(1f))
-        KeyValuePill("冷启动", bootLabel, if (device.bootCdt == "applied") Tone.POSITIVE else Tone.NEUTRAL, Modifier.weight(1f))
-        KeyValuePill("原厂备份", if (device.hasCdtBackup) "已保留" else "无", if (device.hasCdtBackup) Tone.INFO else Tone.NEUTRAL, Modifier.weight(1f))
-        KeyValuePill("基线", baseLabel, Tone.NEUTRAL, Modifier.weight(1f))
     }
 }
 

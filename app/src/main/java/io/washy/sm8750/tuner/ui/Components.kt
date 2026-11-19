@@ -153,6 +153,7 @@ internal fun planStateTag(state: PlanState): Pair<String, Tone> = when (state) {
     PlanState.CDT_PENDING_REBOOT -> "CDT 已写·待重启" to Tone.WARNING
     PlanState.CDT_ACTIVE -> "CDT 冷启动已生效" to Tone.POSITIVE
     PlanState.RESTORE_PENDING_REBOOT -> "已还原·待重启" to Tone.WARNING
+    PlanState.CDT_RECOVERY_REQUIRED -> "CDT 与备份不一致" to Tone.DANGER
     PlanState.EXTERNAL_RUNTIME -> "外部运行时校准" to Tone.DANGER
     PlanState.CORRUPT_CDT -> "CDT 分区异常" to Tone.DANGER
 }
