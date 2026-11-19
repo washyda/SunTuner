@@ -55,6 +55,30 @@ jobs:
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/suntuner-release-notes.md"
+          awk -v version="$VERSION" '
+            $0 == "## " version { found = 1; next }
+            /^## / && found { exit }
+            found { print; if (NF) has_content = 1 }
+            END { if (!has_content) exit 1 }
+          ' CHANGELOG.md > "$notes" || {
+            echo "Missing changelog entry for $VERSION" >&2
+            exit 1
+          }
+          {
+            printf '## 更新内容\n'
+            cat "$notes"
+            printf '## 安装\n下载并安装下方签名的 APK。使用前请确认设备和 CDT 兼容性。\n'
+          } > "$notes.tmp"
+          mv "$notes.tmp" "$notes"
+          echo "RELEASE_NOTES=$notes" >> "$GITHUB_ENV"
+
       - name: Set up JDK 21
         uses: actions/setup-java@v6
         with:
@@ -117,14 +141,7 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: SunTuner ${{ steps.version.outputs.version }}
-          body: |
-            ## 更新内容
-            - 新增 Log 按钮，可查询并导出 CDT、内核版本、CPU 调频策略及相关消费链路诊断信息。
-            - 日志导出会过滤敏感字段，并限制日志内容范围。
-            - 精简发布包，仅包含 arm64-v8a。
-
-            ## 安装
-            下载并安装下方签名的 APK。使用前请确认设备和 CDT 兼容性。
+          body_path: ${{ env.RELEASE_NOTES }}
           files: ${{ env.RELEASE_APK }}
           fail_on_unmatched_files: true
           generate_release_notes: false
