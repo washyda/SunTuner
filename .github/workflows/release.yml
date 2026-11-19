@@ -44,6 +44,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "::error::Start manual releases from the main branch."
+              exit 1
+            fi
             version="$INPUT_VERSION"
             version_code="$INPUT_VERSION_CODE"
           else
@@ -56,9 +60,25 @@ jobs:
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
+      - name: Verify release tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            tagged_source="$(git rev-parse "refs/tags/$TAG^{commit}")"
+            build_source="$(git rev-parse HEAD)"
+            if [[ "$tagged_source" != "$build_source" ]]; then
+              echo "::error::$TAG already points to $tagged_source; this run builds $build_source. Choose a new release version."
+              exit 1
+            fi
+          fi
+
       - name: Prepare release notes
         id: notes
         env:
+          EVENT_NAME: ${{ github.event_name }}
           VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
@@ -77,6 +97,9 @@ jobs:
             } > "$notes.tmp"
             mv "$notes.tmp" "$notes"
             echo "generate=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "::error::Add a non-empty '## $VERSION' section to CHANGELOG.md on main before releasing."
+            exit 1
           else
             : > "$notes"
             echo "::warning::No changelog entry for $VERSION; GitHub will generate release notes."
@@ -84,24 +107,6 @@ jobs:
           fi
           printf '\n## 安装\n下载并安装下方签名的 APK。使用前请确认设备和 CDT 兼容性。\n' >> "$notes"
           echo "RELEASE_NOTES=$notes" >> "$GITHUB_ENV"
-
-      - name: Resolve release source
-        id: source
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          source="$(git rev-parse HEAD)"
-          if git show-ref --verify --quiet "refs/tags/$TAG"; then
-            tagged_source="$(git rev-parse "refs/tags/$TAG^{commit}")"
-            if [[ "$tagged_source" != "$source" ]]; then
-              echo "::notice::Building the existing $TAG from $tagged_source. Release notes use the selected workflow ref."
-              git checkout --detach "$tagged_source"
-              source="$tagged_source"
-            fi
-          fi
-          echo "commit=$source" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v6
@@ -163,7 +168,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          target_commitish: ${{ steps.source.outputs.commit }}
+          target_commitish: ${{ github.sha }}
           name: SunTuner ${{ steps.version.outputs.version }}
           body_path: ${{ env.RELEASE_NOTES }}
           files: ${{ env.RELEASE_APK }}
