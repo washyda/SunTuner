@@ -149,10 +149,8 @@ internal fun KeyValuePill(label: String, value: String, tone: Tone = Tone.NEUTRA
 }
 
 internal fun planStateTag(state: PlanState): Pair<String, Tone> = when (state) {
-    PlanState.STOCK_UNMODIFIED -> "原厂电压" to Tone.NEUTRAL
-    PlanState.CDT_PENDING_REBOOT -> "CDT 已写·待重启" to Tone.WARNING
-    PlanState.CDT_ACTIVE -> "CDT 冷启动已生效" to Tone.POSITIVE
-    PlanState.RESTORE_PENDING_REBOOT -> "已还原·待重启" to Tone.WARNING
+    PlanState.STOCK_UNMODIFIED -> "原厂 CDT" to Tone.NEUTRAL
+    PlanState.CDT_WRITTEN -> "CDT 已写入" to Tone.POSITIVE
     PlanState.CDT_RECOVERY_REQUIRED -> "CDT 与备份不一致" to Tone.DANGER
     PlanState.EXTERNAL_RUNTIME -> "外部运行时校准" to Tone.DANGER
     PlanState.CORRUPT_CDT -> "CDT 分区异常" to Tone.DANGER

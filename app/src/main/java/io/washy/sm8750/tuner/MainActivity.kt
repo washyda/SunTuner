@@ -49,11 +49,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.washy.sm8750.tuner.ui.BenchmarkScreen
-import io.washy.sm8750.tuner.ui.StatusPill
+import io.washy.sm8750.tuner.ui.CompatibilityScreen
 import io.washy.sm8750.tuner.ui.TunerTheme
 import io.washy.sm8750.tuner.ui.TunerThemeTokens
 import io.washy.sm8750.tuner.ui.VoltageScreen
-import io.washy.sm8750.tuner.ui.planStateTag
 
 class MainActivity : ComponentActivity() {
     private val model by lazy { ViewModelProvider(this)[TunerViewModel::class.java] }
@@ -69,6 +68,9 @@ class MainActivity : ComponentActivity() {
             val cdtLogPicker = rememberLauncherForActivityResult(
                 ActivityResultContracts.CreateDocument("text/plain"),
             ) { uri -> uri?.let(model::exportCdtFailureLog) }
+            val cdtBackupPicker = rememberLauncherForActivityResult(
+                ActivityResultContracts.CreateDocument("application/octet-stream"),
+            ) { uri -> uri?.let(model::backupCdt) }
             LaunchedEffect(state.operation) {
                 if (state.operation == Operation.LOADING || state.operation == Operation.WRITING_CDT) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -80,6 +82,7 @@ class MainActivity : ComponentActivity() {
                 TunerApp(
                     state = state,
                     onRefresh = model::refresh,
+                    onCheckCompatibility = model::checkCompatibility,
                     onExportDiagnostics = {
                         val modelName = android.os.Build.MODEL.replace(Regex("[^A-Za-z0-9_-]"), "_").take(40)
                         diagnosticsPicker.launch("SunTuner-$modelName-diagnostics.txt")
@@ -90,7 +93,10 @@ class MainActivity : ComponentActivity() {
                         cdtLogPicker.launch("SunTuner-$modelName-CDT-failure.txt")
                     },
                     onDismissCdtLogExportResult = model::dismissCdtLogExportResult,
-                    onBackupCdt = model::backupCdt,
+                    onBackupCdt = {
+                        val modelName = android.os.Build.MODEL.replace(Regex("[^A-Za-z0-9_-]"), "_").take(40)
+                        cdtBackupPicker.launch("SunTuner-$modelName-CDT.img")
+                    },
                     onDismissCdtBackupResult = model::dismissCdtBackupResult,
                     onEnableCdt = model::enableCdt,
                     onRestoreCdt = { model.restoreCdt(fallbackClean = false) },
@@ -124,6 +130,7 @@ class MainActivity : ComponentActivity() {
 private fun TunerApp(
     state: ScreenState,
     onRefresh: () -> Unit,
+    onCheckCompatibility: () -> Unit,
     onExportDiagnostics: () -> Unit,
     onDismissDiagnosticsResult: () -> Unit,
     onExportCdtFailureLog: () -> Unit,
@@ -149,6 +156,18 @@ private fun TunerApp(
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
 
+    state.compatibilityReport?.let { report ->
+        CompatibilityScreen(
+            report = report,
+            saving = state.operation != null,
+            saved = state.diagnosticsSaved,
+            error = state.error,
+            onSave = onExportDiagnostics,
+            onBack = onDismissDiagnosticsResult,
+        )
+        return
+    }
+
     if (state.cdtLogExportComplete) {
         AlertDialog(
             onDismissRequest = onDismissCdtLogExportResult,
@@ -158,26 +177,14 @@ private fun TunerApp(
         )
     }
 
-    state.diagnosticsExportComplete?.let { complete ->
-        AlertDialog(
-            onDismissRequest = onDismissDiagnosticsResult,
-            title = { Text("诊断报告已保存") },
-            text = {
-                Text(if (complete) "可把导出的文本发给开发者核对适配情况。"
-                    else "报告已保存机型、固件和内核信息。Root 采集失败，授权后可重新导出。")
-            },
-            confirmButton = { TextButton(onClick = onDismissDiagnosticsResult) { Text("完成") } },
-        )
-    }
-
     state.cdtBackupResult?.let { result ->
         AlertDialog(
             onDismissRequest = onDismissCdtBackupResult,
             title = { Text("CDT 分区已备份") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("当前 CDT 完整镜像已导出保存至：")
-                    Text(result.path, style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold))
+                    Text("当前 CDT 完整镜像已保存到所选位置。")
+                    result.displayName?.let { Text(it, fontWeight = FontWeight.Bold) }
                     Text("SHA-256:\n${result.sha256}", style = MaterialTheme.typography.labelSmall)
                 }
             },
@@ -214,17 +221,7 @@ private fun TunerApp(
     Scaffold(
         topBar = {
             if (tab == 1) {
-                TopAppBar(
-                    title = { Text(stringResource(R.string.app_name)) },
-                    actions = {
-                        state.plan?.let { device ->
-                            val (label, tone) = planStateTag(device.state)
-                            StatusPill(label, tone, Modifier.padding(end = 4.dp))
-                        }
-                        TextButton(enabled = state.operation == null, onClick = onRefresh) { Text("刷新") }
-                        TextButton(enabled = state.operation == null, onClick = onExportDiagnostics) { Text("Log") }
-                    },
-                )
+                TopAppBar(title = { Text(stringResource(R.string.app_name)) })
             }
         },
         bottomBar = {
@@ -289,7 +286,7 @@ private fun TunerApp(
                     VoltageScreen(
                         state = state,
                         onRefresh = onRefresh,
-                        onExportDiagnostics = onExportDiagnostics,
+                        onCheckCompatibility = onCheckCompatibility,
                         onBackupCdt = onBackupCdt,
                         onEnableCdt = onEnableCdt,
                         onRestoreCdt = onRestoreCdt,
@@ -371,7 +368,7 @@ private fun TunerPreview() {
     TunerTheme {
         TunerApp(
             state = ScreenState(),
-            onRefresh = {}, onExportDiagnostics = {}, onDismissDiagnosticsResult = {},
+            onRefresh = {}, onCheckCompatibility = {}, onExportDiagnostics = {}, onDismissDiagnosticsResult = {},
             onExportCdtFailureLog = {}, onDismissCdtLogExportResult = {},
             onBackupCdt = {}, onDismissCdtBackupResult = {},
             onEnableCdt = {}, onRestoreCdt = {}, onRestoreFallbackClean = {},

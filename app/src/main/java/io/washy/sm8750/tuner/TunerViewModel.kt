@@ -26,13 +26,6 @@ internal val CORE_PRESETS = listOf(
     CorePreset("单核 CPU6", setOf(6)),
 )
 
-internal data class LiveFreqSample(
-    val domain: Int,
-    val currentKhz: Int,
-    val effectiveMinKhz: Int,
-    val effectiveMaxKhz: Int,
-)
-
 internal data class ScreenState(
     val plan: DevicePlan? = null,
     val cdtPartition: CdtPartition? = null,
@@ -40,11 +33,13 @@ internal data class ScreenState(
     val operation: Operation? = null,
     val status: String? = null,
     val loadPhaseElapsedSec: Int = 0,
+    val loadStopping: Boolean = false,
     val error: String? = null,
     val cdtFailureFeedback: Boolean = false,
     val hasCdtFailureLog: Boolean = false,
     val cdtLogExportComplete: Boolean = false,
-    val diagnosticsExportComplete: Boolean? = null,
+    val compatibilityReport: CompatibilityReport? = null,
+    val diagnosticsSaved: Boolean = false,
     val cdtBackupResult: CdtBackupResult? = null,
     val rebootPrompt: RebootPrompt? = null,
     val pendingRestoreNoBackup: Boolean = false,
@@ -54,7 +49,6 @@ internal data class ScreenState(
     val frequencyMode: FrequencyMode = FrequencyMode.MAX,
     val workload: WorkloadKind = WorkloadKind.FP,
     val fixedFrequencies: Map<Int, Int> = emptyMap(),
-    val liveFrequencies: Map<Int, LiveFreqSample> = emptyMap(),
     val lastRun: LoadRun? = null,
 ) {
     val config: LoadConfig?
@@ -114,12 +108,23 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun exportDiagnostics(destination: Uri) = launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在导出适配诊断…") {
-        val complete = backend.exportDiagnostics(destination)
-        _state.update { it.copy(diagnosticsExportComplete = complete) }
+    fun checkCompatibility() = launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在检测兼容性…") {
+        val report = backend.collectDiagnostics()
+        _state.update { it.copy(compatibilityReport = report, diagnosticsSaved = false) }
     }
 
-    fun dismissDiagnosticsResult() = _state.update { it.copy(diagnosticsExportComplete = null) }
+    fun exportDiagnostics(destination: Uri) {
+        val report = _state.value.compatibilityReport ?: return
+        launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在保存检测日志…") {
+            _state.update { it.copy(diagnosticsSaved = false) }
+            backend.exportDiagnostics(destination, report)
+            _state.update { it.copy(diagnosticsSaved = true) }
+        }
+    }
+
+    fun dismissDiagnosticsResult() = _state.update {
+        if (it.operation != null) it else it.copy(compatibilityReport = null, diagnosticsSaved = false, error = null)
+    }
 
     fun exportCdtFailureLog(destination: Uri) =
         launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在导出 CDT 刷入日志…") {
@@ -129,20 +134,16 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissCdtLogExportResult() = _state.update { it.copy(cdtLogExportComplete = false) }
 
-    fun backupCdt() = launchOperation(Operation.BACKUP_CDT, "正在备份当前 CDT 分区…") {
-        try {
-            val result = backend.backupCdt()
-            _state.update { it.copy(cdtBackupResult = result) }
-        } catch (t: Throwable) {
-            _state.update { it.copy(error = "CDT 备份失败：${t.message ?: t::class.simpleName}") }
-        }
+    fun backupCdt(destination: Uri) = launchOperation(Operation.BACKUP_CDT, "正在备份当前 CDT 分区…") {
+        val result = backend.backupCdt(destination)
+        _state.update { it.copy(cdtBackupResult = result) }
     }
 
     fun dismissCdtBackupResult() = _state.update { it.copy(cdtBackupResult = null) }
 
     fun enableCdt() {
         val plan = _state.value.plan ?: return
-        if (plan.state != PlanState.STOCK_UNMODIFIED && plan.state != PlanState.RESTORE_PENDING_REBOOT) return
+        if (plan.state != PlanState.STOCK_UNMODIFIED) return
         if (_state.value.cdtUncertain) return
         launchOperation(Operation.WRITING_CDT, "正在备份原厂 CDT 并写入 Key 7 = 1…") {
             applyCdtResult(backend.enableCdt(plan.bootId), RebootPrompt.ENABLED_CDT)
@@ -169,12 +170,6 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun applyCdtResult(result: CdtOperationResult, success: RebootPrompt) {
         result.plan?.let(::updatePlan)
-        val planState = result.plan?.state
-        val needsReboot = when (success) {
-            RebootPrompt.ENABLED_CDT -> planState == PlanState.CDT_PENDING_REBOOT
-            RebootPrompt.RESTORED_CDT -> planState == PlanState.RESTORE_PENDING_REBOOT ||
-                planState == PlanState.EXTERNAL_RUNTIME
-        }
         _state.update {
             it.copy(
                 plan = result.plan,
@@ -184,8 +179,8 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
                 cdtFailureFeedback = result.message != null && result.logSaved,
                 hasCdtFailureLog = backend.hasCdtFailureLog,
                 rebootPrompt = success.takeIf {
-                    result.outcome == CdtOutcome.VERIFIED &&
-                        (needsReboot || (planState == null && result.partition != null))
+                    result.outcome == CdtOutcome.VERIFIED && result.partitionChanged &&
+                        (result.partition != null || result.plan != null)
                 },
             )
         }
@@ -256,7 +251,7 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
         launchOperation(Operation.LOADING, "正在准备压测…") {
             val session = LoadControl()
             control = session
-            var firstDomainObserved: Int? = null
+            var firstPolicy: String? = null
             var ticks = 0
             try {
                 val fresh = backend.read()
@@ -267,29 +262,13 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
                 ) { "电压计划或在线核心已变化，请刷新后重试" }
                 val thermalStart = thermal?.currentThermalStatus
                 val stats = backend.runLoad(fresh, config, session) { line ->
-                    when (line) {
-                        "RUNNING" -> {
-                            ticks = 0
-                            _state.update {
-                                val hint = if (config.seconds >= 6) " · 同步采 PVC" else ""
-                                it.copy(status = "正在压测 ${config.workload.label}$hint", loadPhaseElapsedSec = 0)
-                            }
-                        }
-                        else -> if (line.startsWith("PROGRESS ")) {
-                            val fields = line.split(' ')
-                            val domain = domainFor(fields[1].toInt())
-                            val current = fields[2].toInt()
-                            val minimum = fields[4].toInt()
-                            val maximum = fields[5].toInt()
-                            if (firstDomainObserved == null) firstDomainObserved = domain
-                            if (domain == firstDomainObserved) ticks += 1
-                            _state.update {
-                                it.copy(
-                                    loadPhaseElapsedSec = ticks.coerceAtMost(config.seconds),
-                                    liveFrequencies = it.liveFrequencies +
-                                        (domain to LiveFreqSample(domain, current, minimum, maximum)),
-                                )
-                            }
+                    if (line.startsWith("PROGRESS ")) {
+                        val policy = line.substringAfter(' ').substringBefore(' ')
+                        // The worker emits one line per active policy each second.
+                        if (firstPolicy == null) firstPolicy = policy
+                        if (policy == firstPolicy) {
+                            ticks = (ticks + 1).coerceAtMost(config.seconds)
+                            _state.update { it.copy(loadPhaseElapsedSec = ticks) }
                         }
                     }
                 } ?: return@launchOperation
@@ -310,6 +289,8 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stopLoad() {
         val session = control ?: return
+        if (_state.value.loadStopping) return
+        _state.update { it.copy(loadStopping = true) }
         viewModelScope.launch(Dispatchers.IO) { session.stop() }
     }
 
@@ -356,7 +337,7 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } finally {
                 _state.update {
-                    it.copy(operation = null, status = null, loadPhaseElapsedSec = 0, liveFrequencies = emptyMap())
+                    it.copy(operation = null, status = null, loadPhaseElapsedSec = 0, loadStopping = false)
                 }
             }
         }

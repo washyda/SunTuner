@@ -8,16 +8,18 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -32,14 +34,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import io.washy.sm8750.tuner.CORE_PRESETS
 import io.washy.sm8750.tuner.FrequencyMode
 import io.washy.sm8750.tuner.Level
-import io.washy.sm8750.tuner.LiveFreqSample
 import io.washy.sm8750.tuner.Operation
 import io.washy.sm8750.tuner.ScreenState
 import io.washy.sm8750.tuner.WorkloadKind
@@ -59,6 +59,7 @@ internal fun BenchmarkScreen(
     onStart: () -> Unit,
     onStop: () -> Unit,
 ) {
+    val running = state.operation == Operation.LOADING
     val editable = state.operation == null && state.plan != null
     val config = state.config
     var showCustomCores by rememberSaveable { mutableStateOf(false) }
@@ -67,19 +68,6 @@ internal fun BenchmarkScreen(
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        if (state.operation == Operation.LOADING && config != null) {
-            item {
-                LiveMonitorCard(
-                    status = state.status ?: "压测运行中…",
-                    elapsedSec = state.loadPhaseElapsedSec,
-                    totalSec = config.seconds,
-                    liveFrequencies = state.liveFrequencies,
-                    targets = config.targets,
-                    onStop = onStop,
-                )
-            }
-        }
-
         item {
             Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -177,10 +165,44 @@ internal fun BenchmarkScreen(
                     }
 
                     Button(
-                        onClick = onStart,
-                        enabled = editable && config != null,
+                        onClick = if (running) onStop else onStart,
+                        enabled = if (running) !state.loadStopping else editable && config != null,
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("开始烤机") }
+                    ) {
+                        if (running) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    color = LocalContentColor.current,
+                                    strokeWidth = 2.dp,
+                                )
+                                Text(if (state.loadStopping) "正在停止…" else "停止烤机")
+                            }
+                        } else {
+                            Text("开始烤机")
+                        }
+                    }
+                    if (running) {
+                        val total = state.seconds.toIntOrNull()?.coerceAtLeast(1) ?: 1
+                        val elapsed = state.loadPhaseElapsedSec.coerceIn(0, total)
+                        if (elapsed == 0 && !state.loadStopping) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth())
+                        } else {
+                            LinearProgressIndicator(
+                                progress = { elapsed.toFloat() / total },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        Text(
+                            "${elapsed}s / ${total}s",
+                            modifier = Modifier.align(Alignment.End),
+                            style = MaterialTheme.typography.labelMedium.tabular(),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }
@@ -197,7 +219,7 @@ internal fun BenchmarkScreen(
             item {
                 RunTechnicalDetails(run = run)
             }
-        } else {
+        } else if (!running) {
             item {
                 Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
                     Text(
@@ -208,63 +230,6 @@ internal fun BenchmarkScreen(
                     )
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun LiveMonitorCard(
-    status: String,
-    elapsedSec: Int,
-    totalSec: Int,
-    liveFrequencies: Map<Int, LiveFreqSample>,
-    targets: Map<Int, Int>,
-    onStop: () -> Unit,
-) {
-    Surface(
-        Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        color = MaterialTheme.colorScheme.primaryContainer,
-    ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text(status, style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold), color = MaterialTheme.colorScheme.onPrimaryContainer)
-                Text("${elapsedSec}s / ${totalSec}s", style = MaterialTheme.typography.labelLarge.tabular(), color = MaterialTheme.colorScheme.onPrimaryContainer)
-            }
-            if (elapsedSec > 0) {
-                LinearProgressIndicator(
-                    progress = { (elapsedSec.toFloat() / totalSec.coerceAtLeast(1)).coerceIn(0f, 1f) },
-                    modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-                )
-            } else {
-                LinearProgressIndicator(Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)))
-            }
-            liveFrequencies.toSortedMap().values.forEach { sample ->
-                val target = targets[sample.domain]
-                val minimum = sample.effectiveMinKhz
-                val maximum = sample.effectiveMaxKhz
-                val current = sample.currentKhz.takeIf { it > 0 }?.let { mhzLabel(it) } ?: "—"
-                val range = if (minimum > 0 && maximum > 0) frequencyRangeLabel(minimum, maximum) else "—"
-                val targetText = target?.let { " · 目标 ${mhzLabel(it)}" }.orEmpty()
-                val constrained = target != null && (minimum != target || maximum != target)
-                val stateText = if (target != null && maximum in 1 until target) " · 上限受限"
-                    else if (constrained) " · 锁频未生效" else ""
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = MaterialTheme.colorScheme.surfaceContainerLow,
-                    shape = MaterialTheme.shapes.medium,
-                ) {
-                    Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text("PDP${sample.domain} · 当前 $current", style = MaterialTheme.typography.labelMedium.tabular())
-                        Text(
-                            "有效 $range$targetText$stateText",
-                            style = MaterialTheme.typography.bodySmall.tabular(),
-                            color = if (constrained) TunerThemeTokens.extended.warning else MaterialTheme.colorScheme.onSurface,
-                        )
-                    }
-                }
-            }
-            OutlinedButton(onClick = onStop, modifier = Modifier.fillMaxWidth()) { Text("停止烤机") }
         }
     }
 }

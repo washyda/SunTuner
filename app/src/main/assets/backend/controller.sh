@@ -210,14 +210,10 @@ classify_state() {
         state=CDT_RECOVERY_REQUIRED
     elif [ "$cdt_disk" = corrupt ] || [ "$cdt_backup_status" = invalid ]; then
         state=CORRUPT_CDT
+    elif [ "$cdt_disk" = slt_enabled ]; then
+        state=CDT_WRITTEN
     elif [ "$apns_slot" = external ]; then
         state=EXTERNAL_RUNTIME
-    elif [ "$cdt_disk" = slt_enabled ] && [ "$boot_cdt" = applied ]; then
-        state=CDT_ACTIVE
-    elif [ "$cdt_disk" = slt_enabled ]; then
-        state=CDT_PENDING_REBOOT
-    elif [ "$boot_cdt" = applied ]; then
-        state=RESTORE_PENDING_REBOOT
     else
         state=STOCK_UNMODIFIED
     fi
@@ -228,7 +224,7 @@ classify_state() {
 
 maybe_persist_stock_baseline() {
     plan_file=$1
-    if [ "$boot_cdt" = not_found ] && [ "$apns_slot" != external ]; then
+    if [ "$state" = STOCK_UNMODIFIED ] && [ "$boot_cdt" = not_found ]; then
         grep '^[01],' "$plan_file" > "$work/stock-rows.tmp" || true
         if [ "$(wc -l < "$work/stock-rows.tmp")" -eq 32 ]; then
             cp "$work/stock-rows.tmp" "$persistent/stock-baseline.csv.tmp"
@@ -258,7 +254,7 @@ prepare_report() {
     printf '%s\n' "$online" | grep -Eq '^[0-7](-[0-7])?(,[0-7](-[0-7])?)*$' ||
         die "在线 CPU 状态无效"
     if [ -f "$persistent/stock-baseline.csv" ]; then
-        cp "$persistent/stock-baseline.csv" "$work/baseline" || die "无法读取原厂电压计划"
+        cp "$persistent/stock-baseline.csv" "$work/baseline" 2>/dev/null || rm -f "$work/baseline"
     fi
 }
 
@@ -282,7 +278,7 @@ capture_cdt_plan() {
 }
 
 emit_report() {
-    if [ "$state" = STOCK_UNMODIFIED ]; then
+    if [ "$state" = STOCK_UNMODIFIED ] && [ "$boot_cdt" = not_found ]; then
         baseline_source=current_stock
     elif [ -f "$work/baseline" ]; then
         baseline_source=persisted
@@ -491,8 +487,54 @@ print_diagnostic_log() {
     '
 }
 
+diagnostic_read_only_value() {
+    local label="$1" value
+    shift
+    value=$("$@" 2>/dev/null) || value=unknown
+    case "$value" in 0|1) ;; *) value=unknown ;; esac
+    printf '%s=%s\n' "$label" "$value"
+}
+
+print_cdt_write_log() {
+    awk -v block="$1" -v parent="$2" -v audit_only="$3" '
+        function has_name(line, name,    rest, i, before, after) {
+            if (name == "") return 0
+            rest = line
+            while ((i = index(rest, name)) != 0) {
+                before = i == 1 ? "" : substr(rest, i - 1, 1)
+                after = substr(rest, i + length(name), 1)
+                if (before !~ /[[:alnum:]_]/ && after !~ /[[:alnum:]_]/) return 1
+                rest = substr(rest, i + length(name))
+            }
+            return 0
+        }
+        {
+            line = tolower($0)
+            if (line ~ /serial|imei|meid|mac[ _-]*addr|keybox|androidboot[.]/) next
+            cdt = has_name(line, "cdt") || has_name(line, block)
+            if ((has_name(line, "baseband_guard") || has_name(line, "bbg")) &&
+                line ~ /deny|denied|reject|blocked|write[ _-]*protect/) {
+                if (!cdt && !has_name(line, "cdt_tool")) next
+            } else if (line ~ /avc:[[:space:]]*denied/) {
+                if (!cdt && !(has_name(line, "cdt_tool") && line ~ /tclass=blk_file/)) next
+            } else {
+                if (audit_only || !(cdt || has_name(line, parent))) next
+                if (line !~ /write[ _-]*protect|write[ _-]*(denied|refused|reject|fail|error)|read[ _-]*only|operation not permitted|permission denied|op .*write|i\/o error.*write|write.*i\/o error/) next
+            }
+            gsub(/[[:cntrl:]]/, " ")
+            entries[count++ % 60] = substr($0, 1, 420)
+        }
+        END {
+            if (!count) print "[no matching retained entries]"
+            if (count > 60) print "[showing the latest 60 matching entries]"
+            for (i = count > 60 ? count - 60 : 0; i < count; ++i) print entries[i % 60]
+        }
+    '
+}
+
 collect_diagnostics() {
     local cdt_dev path prop value attribute policy
+    local cdt_block= cdt_parent= cdt_sysfs= parent_sysfs=
     printf '[boot and kernel]\n'
     printf 'KERNEL_RELEASE=%s\n' "$(uname -r)"
     for prop in ro.boot.slot_suffix ro.boot.slot ro.boot.hardware ro.product.vendor.device         ro.vendor.build.fingerprint ro.soc.manufacturer ro.soc.model; do
@@ -509,6 +551,21 @@ collect_diagnostics() {
         printf 'CDT_DEV=%s\nCDT_BLOCK=%s\n' "$cdt_dev" "$path"
         value=$(blockdev --getsize64 "$cdt_dev" 2>/dev/null) || value=unknown
         printf 'CDT_PARTITION_BYTES=%s\n' "$value"
+        diagnostic_read_only_value CDT_BLOCKDEV_RO blockdev --getro "$cdt_dev"
+        if [ "$path" != unknown ]; then
+            cdt_block=${path##*/}
+            cdt_sysfs=$(readlink -f "/sys/class/block/$cdt_block" 2>/dev/null) || cdt_sysfs=
+        fi
+        if [ -n "$cdt_sysfs" ] && [ -f "$cdt_sysfs/partition" ]; then
+            parent_sysfs=${cdt_sysfs%/*}
+            cdt_parent=${parent_sysfs##*/}
+        fi
+        diagnostic_read_only_value CDT_SYSFS_RO cat "${cdt_sysfs:+$cdt_sysfs/ro}"
+        if [ -n "$parent_sysfs" ]; then
+            printf 'CDT_PARENT_BLOCK=%s\n' "$cdt_parent"
+            diagnostic_read_only_value CDT_PARENT_SYSFS_RO cat "$parent_sysfs/ro"
+        fi
+        printf 'RO values: 1=read_only, 0=not_marked_read_only; 0 does not prove writes are permitted.\n'
         if cp "$bundle/cdt_tool" "$work/cdt_tool" 2>/dev/null && chmod 700 "$work/cdt_tool" 2>/dev/null &&
             "$work/cdt_tool" backup "$cdt_dev" "$work/cdt.bin" 2>/dev/null &&
             "$work/cdt_tool" status "$work/cdt.bin" "$persistent/cdt-orig.bin" > "$work/cdt.status" 2>/dev/null; then
@@ -559,7 +616,28 @@ collect_diagnostics() {
     if dmesg > "$work/kernel.log" 2>/dev/null; then
         print_diagnostic_log < "$work/kernel.log"
     else
+        rm -f -- "$work/kernel.log"
         printf '[kernel log unavailable]\n'
+    fi
+
+    printf '\n[CDT write protection and security modules]\n'
+    value=$(getenforce 2>/dev/null) || value=unknown
+    case "$value" in Enforcing|Permissive|Disabled) ;; *) value=unknown ;; esac
+    printf 'SELINUX_MODE=%s\n' "$value"
+    value=$(cat /sys/kernel/security/lsm 2>/dev/null) || value=unknown
+    printf 'ACTIVE_LSM=%s\n' "${value:-unknown}"
+    printf 'Only retained CDT or parent-device messages are shown; missing entries do not establish write access.\n'
+    printf '\n[CDT write-related kernel messages]\n'
+    if [ -f "$work/kernel.log" ]; then
+        print_cdt_write_log "$cdt_block" "$cdt_parent" 0 < "$work/kernel.log"
+    else
+        printf '[kernel log unavailable]\n'
+    fi
+    printf '\n[CDT SELinux and BBG denials from logcat]\n'
+    if logcat -b all -d -t 2000 > "$work/audit.log" 2>/dev/null; then
+        print_cdt_write_log "$cdt_block" "$cdt_parent" 1 < "$work/audit.log"
+    else
+        printf '[logcat unavailable]\n'
     fi
 }
 
@@ -583,7 +661,7 @@ mkdir -p "$root" "$persistent"
 exec 9>"$root/lock"
 flock -n 9 9>&9 || die "有另一个降压或烤机任务正在运行"
 if [ "$action" = cdt_backup ]; then
-    [ "$#" -le 1 ] || die "备份参数无效"
+    [ "$#" = 0 ] || die "备份参数无效"
     cdt_dev=$(find_cdt_dev) || die "未找到 CDT 分区"
     [ -b "$cdt_dev" ] || die "CDT 路径不是块设备"
     work=$(mktemp -d "$root/work.XXXXXXXX")
@@ -592,12 +670,10 @@ if [ "$action" = cdt_backup ]; then
     prepare_cdt_tool
     "$work/cdt_tool" backup "$cdt_dev" "$work/cdt.bin" || die "读取完整 CDT 镜像失败"
     digest=$(sha256sum "$work/cdt.bin") || die "计算备份校验值失败"
-    dest="${1:-/sdcard/Download/cdt-backup-$(date +%Y%m%d-%H%M%S).img}"
-    mkdir -p "$(dirname "$dest")" 2>/dev/null || true
-    cp "$work/cdt.bin" "$dest" || die "写入备份文件失败"
-    chmod 664 "$dest" 2>/dev/null || true
-    printf 'CDT_BACKUP_PATH %s\n' "$dest"
     printf 'CDT_SHA256 %s\n' "${digest%% *}"
+    printf 'CDT_IMAGE_BEGIN\n'
+    base64 "$work/cdt.bin" || die "读取备份数据失败"
+    printf '\nCDT_IMAGE_END\n'
     exit 0
 fi
 boot=$(cat "$boot_file")

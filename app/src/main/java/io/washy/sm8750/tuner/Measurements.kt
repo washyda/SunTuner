@@ -15,9 +15,7 @@ internal data class Level(val domain: Int, val index: Int, val khz: Int, val mic
 
 internal enum class PlanState {
     STOCK_UNMODIFIED,
-    CDT_PENDING_REBOOT,
-    CDT_ACTIVE,
-    RESTORE_PENDING_REBOOT,
+    CDT_WRITTEN,
     CDT_RECOVERY_REQUIRED,
     EXTERNAL_RUNTIME,
     CORRUPT_CDT,
@@ -312,13 +310,13 @@ internal fun parsePlan(output: String): DevicePlan {
     }.toSet()
     val current = rows("current")
     val state = PlanState.valueOf(field("STATE").uppercase())
-    val baselineSource = BaselineSource.valueOf(field("BASELINE_SOURCE").uppercase())
-    val baseline = when (baselineSource) {
+    val declaredBaselineSource = BaselineSource.valueOf(field("BASELINE_SOURCE").uppercase())
+    val baseline = when (declaredBaselineSource) {
         BaselineSource.CURRENT_STOCK -> current
-        BaselineSource.PERSISTED -> rows("baseline")
+        BaselineSource.PERSISTED -> runCatching { rows("baseline") }.getOrNull()
+            ?.takeIf { baseline -> baseline.map { it.khz } == current.map { it.khz } }
         BaselineSource.NONE -> null
     }
-    require(baseline == null || baseline.map { it.khz } == current.map { it.khz }) { "频点表已变更" }
     require(lines.contains("END")) { "SCMI 读回未完成" }
 
     return DevicePlan(
@@ -331,7 +329,7 @@ internal fun parsePlan(output: String): DevicePlan {
         bootCdt = field("BOOT_CDT"),
         bootPlatformInfo = field("BOOT_PLATFORM_INFO"),
         apnsSlot = field("APNS_SLOT"),
-        baselineSource = baselineSource,
+        baselineSource = if (baseline == null) BaselineSource.NONE else declaredBaselineSource,
         online = online,
         baseline = baseline,
         current = current,

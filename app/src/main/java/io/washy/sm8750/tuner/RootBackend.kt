@@ -3,10 +3,13 @@ package io.washy.sm8750.tuner
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import android.system.Os
 import android.util.AtomicFile
+import android.util.Base64
 import java.io.File
 import java.io.OutputStream
+import java.security.MessageDigest
 import java.time.Instant
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -45,12 +48,22 @@ internal class MissingCdtBackupException(message: String) : IllegalStateExceptio
 internal enum class CdtOutcome { VERIFIED, UNCHANGED, ROLLED_BACK, UNKNOWN }
 
 internal data class CdtPartition(val bootId: String, val disk: String, val backupStatus: String) {
+    val state: PlanState?
+        get() = when {
+            backupStatus == "mismatch" -> PlanState.CDT_RECOVERY_REQUIRED
+            disk == "corrupt" || backupStatus == "invalid" -> PlanState.CORRUPT_CDT
+            disk == "slt_enabled" -> PlanState.CDT_WRITTEN
+            disk == "empty" || disk == "stock" -> PlanState.STOCK_UNMODIFIED
+            else -> null
+        }
+
     val canRestore: Boolean
         get() = disk == "slt_enabled" || backupStatus in setOf("match", "enabled_match", "mismatch")
 }
 
 internal data class CdtOperationResult(
     val outcome: CdtOutcome,
+    val partitionChanged: Boolean,
     val partition: CdtPartition?,
     val plan: DevicePlan?,
     val message: String?,
@@ -91,7 +104,7 @@ internal class RootBackend(private val context: Context) {
 
     suspend fun read(): DevicePlan = parsePlan(command(listOf("read")))
 
-    suspend fun exportDiagnostics(destination: Uri): Boolean = withContext(Dispatchers.IO) {
+    suspend fun collectDiagnostics(): CompatibilityReport = withContext(Dispatchers.IO) {
         val rootReport = try {
             command(listOf("diagnostics"))
         } catch (e: CancellationException) {
@@ -99,33 +112,37 @@ internal class RootBackend(private val context: Context) {
         } catch (_: Exception) {
             null
         }
-        val output = context.contentResolver.openOutputStream(destination, "wt")
-            ?: error("无法打开诊断报告")
-        output.bufferedWriter(Charsets.UTF_8).use { writer ->
-            writer.appendLine("SunTuner compatibility report v1")
-            writer.appendLine("MODEL=${Build.MODEL}")
-            writer.appendLine("MANUFACTURER=${Build.MANUFACTURER}")
-            writer.appendLine("DEVICE=${Build.DEVICE}")
-            writer.appendLine("PRODUCT=${Build.PRODUCT}")
-            writer.appendLine("BOARD=${Build.BOARD}")
-            writer.appendLine("ANDROID_RELEASE=${Build.VERSION.RELEASE}")
-            writer.appendLine("FIRMWARE_FINGERPRINT=${Build.FINGERPRINT}")
-            writer.appendLine("KERNEL=${Os.uname().release}")
-            writer.appendLine("ABIS=${Build.SUPPORTED_ABIS.joinToString(",")}")
-            writer.appendLine()
+        val report = buildString {
+            appendLine("SunTuner compatibility report v1")
+            appendLine("MODEL=${Build.MODEL}")
+            appendLine("MANUFACTURER=${Build.MANUFACTURER}")
+            appendLine("DEVICE=${Build.DEVICE}")
+            appendLine("PRODUCT=${Build.PRODUCT}")
+            appendLine("BOARD=${Build.BOARD}")
+            appendLine("ANDROID_RELEASE=${Build.VERSION.RELEASE}")
+            appendLine("FIRMWARE_FINGERPRINT=${Build.FINGERPRINT}")
+            appendLine("KERNEL=${Os.uname().release}")
+            appendLine("ABIS=${Build.SUPPORTED_ABIS.joinToString(",")}")
+            appendLine()
             if (rootReport != null) {
-                writer.append(rootReport)
+                append(rootReport)
             } else {
-                writer.appendLine("ROOT_PROBE=unavailable (check Root authorization and retry)")
+                appendLine("ROOT_PROBE=unavailable (check Root authorization and retry)")
             }
             val previousFailure = readCdtFailureLog()
             if (previousFailure != null) {
-                writer.appendLine()
-                writer.appendLine("[last CDT operation failure]")
-                writer.append(previousFailure)
+                appendLine()
+                appendLine("[last CDT operation failure]")
+                append(previousFailure)
             }
         }
-        rootReport != null
+        CompatibilityReport(report, rootReport)
+    }
+
+    suspend fun exportDiagnostics(destination: Uri, report: CompatibilityReport) = withContext(Dispatchers.IO) {
+        val output = context.contentResolver.openOutputStream(destination, "wt")
+            ?: error("无法打开诊断报告")
+        output.bufferedWriter(Charsets.UTF_8).use { it.write(report.text) }
     }
 
     suspend fun enableCdt(bootId: String): CdtOperationResult =
@@ -183,6 +200,8 @@ internal class RootBackend(private val context: Context) {
         if (outcome != CdtOutcome.VERIFIED || operationFailure != null) {
             saveCdtFailureLog(log.toString())
         }
+        var partitionChanged = operation.field("CDT_ACTION") in
+            setOf("enabled_verified", "restored_from_backup", "restored_clean_fallback")
         if (outcome == CdtOutcome.UNKNOWN) {
             val recovery = traceCommand(listOf("cdt_recover", args[1]), log)
             if (started && recovery.failure == null) {
@@ -191,6 +210,7 @@ internal class RootBackend(private val context: Context) {
                     "previous_verified" -> CdtOutcome.ROLLED_BACK
                     else -> CdtOutcome.UNKNOWN
                 }
+                partitionChanged = outcome == CdtOutcome.VERIFIED
             }
         }
 
@@ -212,7 +232,7 @@ internal class RootBackend(private val context: Context) {
         log.appendLine("END_UTC=${Instant.now()}")
         val logSaved = (outcome != CdtOutcome.VERIFIED || operationFailure != null || plan == null) &&
             saveCdtFailureLog(log.toString())
-        CdtOperationResult(outcome, partition, plan, message, logSaved)
+        CdtOperationResult(outcome, partitionChanged, partition, plan, message, logSaved)
     }
 
     private suspend fun traceCommand(args: List<String>, log: StringBuilder): CdtCommandTrace {
@@ -273,14 +293,26 @@ internal class RootBackend(private val context: Context) {
         command(listOf("reboot", bootId))
     }
 
-    suspend fun backupCdt(customPath: String? = null): CdtBackupResult {
-        val args = if (customPath != null) listOf("cdt_backup", customPath) else listOf("cdt_backup")
-        val lines = command(args).lines()
-        val path = lines.firstOrNull { it.startsWith("CDT_BACKUP_PATH ") }?.removePrefix("CDT_BACKUP_PATH ")
-            ?: throw IllegalStateException("未返回备份保存路径")
-        val sha256 = lines.firstOrNull { it.startsWith("CDT_SHA256 ") }?.removePrefix("CDT_SHA256 ")
-            ?: throw IllegalStateException("未返回备份校验哈希")
-        return CdtBackupResult(path, sha256)
+    suspend fun backupCdt(destination: Uri): CdtBackupResult = withContext(Dispatchers.IO) {
+        val output = command(listOf("cdt_backup"))
+        val sha256 = output.lineSequence().singleOrNull { it.startsWith("CDT_SHA256 ") }
+            ?.removePrefix("CDT_SHA256 ")
+            ?: error("未返回备份校验哈希")
+        val encoded = output.substringAfter("CDT_IMAGE_BEGIN\n", "").substringBefore("\nCDT_IMAGE_END", "")
+        check(encoded.isNotBlank()) { "未返回完整 CDT 镜像" }
+        val image = Base64.decode(encoded, Base64.DEFAULT)
+        val actualSha256 = MessageDigest.getInstance("SHA-256").digest(image).joinToString("") { "%02x".format(it) }
+        check(actualSha256 == sha256) { "CDT 镜像校验失败" }
+
+        val resolver = context.contentResolver
+        val stream = resolver.openOutputStream(destination, "wt") ?: error("无法打开 CDT 备份文件")
+        stream.use { it.write(image) }
+        val displayName = runCatching {
+            resolver.query(destination, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                if (it.moveToFirst()) it.getString(0) else null
+            }
+        }.getOrNull()
+        CdtBackupResult(displayName, sha256)
     }
 
     suspend fun runLoad(
@@ -345,6 +377,6 @@ internal class RootBackend(private val context: Context) {
 }
 
 internal data class CdtBackupResult(
-    val path: String,
+    val displayName: String?,
     val sha256: String,
 )
