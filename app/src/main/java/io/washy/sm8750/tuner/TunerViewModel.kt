@@ -4,6 +4,7 @@ import android.app.Application
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
@@ -34,6 +35,7 @@ internal val CORE_PRESETS = listOf(
 
 internal data class ScreenState(
     val plan: DevicePlan? = null,
+    val benchmarkDevice: BenchmarkDevice? = null,
     val cdtPartition: CdtPartition? = null,
     val cdtUncertain: Boolean = false,
     val operation: Operation? = null,
@@ -60,24 +62,40 @@ internal data class ScreenState(
     val gameResult: GameResult? = null,
     val sltChanges: Map<Int, Int> = emptyMap(),
 ) {
+    val benchmarkOnline: Set<Int> get() = benchmarkDevice?.online ?: plan?.online.orEmpty()
+    val benchmarkFrequencies: Map<Int, List<Int>>
+        get() = benchmarkDevice?.frequencies ?: plan?.current.orEmpty().frequenciesByDomain()
+
     val config: LoadConfig?
         get() {
+            if (frequencyMode == FrequencyMode.FIXED && benchmarkDevice?.fixedSupported == false) return null
             val threadCount = threads.toIntOrNull() ?: return null
             val duration = seconds.toIntOrNull()?.takeIf { it >= 5 } ?: return null
             val domains = cores.map(::domainFor).toSet()
             val targets = if (frequencyMode == FrequencyMode.FIXED) domains.mapNotNull { domain ->
-                val levels = plan?.current.orEmpty().filter { it.domain == domain }
-                val selected = fixedFrequencies[domain]?.takeIf { khz -> levels.any { it.khz == khz } }
-                    ?: levels.maxOfOrNull { it.khz }
+                val frequencies = benchmarkFrequencies[domain].orEmpty()
+                val selected = fixedFrequencies[domain]?.takeIf { it in frequencies }
+                    ?: frequencies.maxOrNull()
                 selected?.let { domain to it }
             }.toMap() else emptyMap()
             return LoadConfig(cores, threadCount, duration, frequencyMode, targets, workload).takeIf { it.valid }
         }
 }
 
+internal data class CrashLogState(
+    val entries: List<CrashEntry> = emptyList(),
+    val busy: Boolean = false,
+    val error: String? = null,
+    val notice: String? = null,
+)
+
 internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     private val backend = RootBackend(app)
+    private val isSm8850 = Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL.equals("SM8850", ignoreCase = true)
     private val gameStore = GameResultStore(app)
+    private val crashLogStore = CrashLogStore(app)
+    private val _crashLogState = MutableStateFlow(CrashLogState())
+    val crashLogState = _crashLogState.asStateFlow()
     private val thermal = app.getSystemService(PowerManager::class.java)
     private val _state = MutableStateFlow(ScreenState(hasCdtFailureLog = backend.hasCdtFailureLog))
     val state = _state.asStateFlow()
@@ -89,30 +107,163 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { if (it.gameSession == null && it.gameResult == null) it.copy(gameResult = saved) else it }
         }
         // The legacy refresh loads PJZ110-specific probe modules.
-        if (Build.MODEL.equals("PJZ110", ignoreCase = true)) refresh()
+        if (isSm8850 || Build.MODEL.equals("PJZ110", ignoreCase = true)) refresh()
+    }
+
+    fun refreshCrashLogs() = updateCrashLogs("读取崩溃日志失败") {
+        val history = withContext(Dispatchers.IO) { crashLogStore.read() }
+        _crashLogState.update { it.copy(entries = history.entries) }
+        val scan = scanCrashLogs()
+        withContext(Dispatchers.IO) {
+            val updated = history.withScan(scan)
+            if (updated != history) crashLogStore.write(updated)
+            _crashLogState.update { it.copy(entries = updated.entries) }
+        }
+    }
+
+    fun deleteCrashLogs(entryId: String?) = updateCrashLogs("删除崩溃日志失败") {
+        val history = withContext(Dispatchers.IO) { crashLogStore.read() }
+        val scan = scanCrashLogs()
+        val current = history.withScan(scan)
+        val selected = current.entries.filter { entryId == null || it.id == entryId }
+        if (entryId != null) check(selected.isNotEmpty()) { "记录已变化，请刷新后重试" }
+
+        val clearAll = entryId == null
+        val archive = listOf("delete_critical")
+        fun commandFor(record: CrashEvidence): List<String>? = when {
+            record.deleteArgs.isEmpty() -> null
+            clearAll && record.deleteArgs.first() == archive.first() -> archive
+            else -> record.deleteArgs
+        }
+        val evidence = selected.flatMap { it.evidence } + if (clearAll) scan.kernelEvidence else emptyList()
+        val commands = (listOfNotNull(archive.takeIf { clearAll }) + evidence.mapNotNull(::commandFor)).distinct()
+        val failures = mutableMapOf<List<String>, String>()
+        for (command in commands) {
+            try {
+                backend.deleteCrashEvidence(command)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failures[command] = e.message?.take(180) ?: "设备拒绝删除"
+            }
+        }
+
+        val failedEntries = selected.mapNotNull { entry ->
+            val retainedEvidence = entry.evidence.filter { commandFor(it) in failures }
+            when {
+                retainedEvidence.isNotEmpty() -> entry.copy(evidence = retainedEvidence)
+                archive in failures && entry.evidence.isEmpty() && entry.source.contains("OPlus critical.log") -> entry
+                else -> null
+            }
+        }
+        val remaining = current.copy(entries = (current.entries - selected.toSet()) + failedEntries)
+        withContext(Dispatchers.IO) { crashLogStore.write(remaining) }
+        _crashLogState.update { it.copy(entries = remaining.entries) }
+
+        val after = scanCrashLogs()
+        val updated = remaining.withScan(after)
+        withContext(Dispatchers.IO) { crashLogStore.write(updated) }
+        val observed = if (clearAll) after.entries else after.entries.filter { it.id == entryId }
+        val stillPresent = observed.flatMap { it.evidence }.mapNotNull(::commandFor)
+            .any { it in commands && it !in failures }
+        val failureDetails = failures.values.distinct().joinToString("\n")
+        val readOnly = evidence.any { it.deleteArgs.isEmpty() }
+        _crashLogState.update {
+            when {
+                failures.isNotEmpty() -> it.copy(error = "部分设备日志删除失败。\n$failureDetails")
+                stillPresent -> it.copy(error = "设备日志仍存在，可能已被系统重新写入。")
+                readOnly -> it.copy(notice = "可删除的记录已处理。系统重启原因或只读内核日志仍由系统提供。")
+                else -> it.copy(notice = "日志已删除")
+            }
+        }
+        _crashLogState.update { it.copy(entries = updated.entries) }
+    }
+
+    fun exportCrashLog(destination: Uri, entry: CrashEntry) {
+        updateCrashLogs("保存崩溃日志失败") {
+            backend.exportCrashLog(destination, entry)
+            _crashLogState.update { it.copy(notice = "崩溃日志已下载") }
+        }
+    }
+
+    private suspend fun scanCrashLogs(): CrashScan {
+        val raw = backend.readCrashLogs()
+        val bootStart = System.currentTimeMillis() - SystemClock.elapsedRealtime()
+        return withContext(Dispatchers.IO) { parseCrashLogs(raw, bootStart) }
+    }
+
+    private fun updateCrashLogs(errorLabel: String, action: suspend () -> Unit) {
+        if (_crashLogState.value.busy) return
+        _crashLogState.update { it.copy(busy = true, error = null, notice = null) }
+        viewModelScope.launch {
+            try {
+                action()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _crashLogState.update {
+                    it.copy(error = listOfNotNull(errorLabel, e.message?.take(180)).joinToString("。"))
+                }
+            } finally {
+                _crashLogState.update { it.copy(busy = false) }
+            }
+        }
     }
 
     fun refresh() = launchOperation(Operation.READING, "正在读取 CDT 分区与电压计划…") {
         val wasUncertain = _state.value.cdtUncertain
-        val recoveryMessage = try {
-            val recovery = backend.retryCdtRecovery(appendFailureLog = wasUncertain)
+        val recovery = try {
+            val recovered = backend.retryCdtRecovery(appendFailureLog = wasUncertain)
             val partition = backend.readCdtPartition()
             _state.update {
                 it.copy(cdtPartition = partition, cdtUncertain = false, hasCdtFailureLog = backend.hasCdtFailureLog)
             }
-            when (recovery) {
+            Result.success(when (recovered) {
                 "previous_verified" -> "已恢复并校验操作前的 CDT。"
                 "target_verified" -> "已确认并校验上次操作的目标 CDT。"
                 else -> null
-            }
+            })
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            _state.update { it.copy(cdtPartition = null) }
-            throw e
+            _state.update { it.copy(cdtPartition = null, hasCdtFailureLog = backend.hasCdtFailureLog) }
+            Result.failure(e)
+        }
+        val cpu = if (isSm8850) {
+            val device = try {
+                backend.readBenchmarkDevice()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(benchmarkDevice = null) }
+                recovery.getOrThrow()
+                throw e
+            }
+            _state.update {
+                it.copy(
+                    benchmarkDevice = device,
+                    cores = it.cores.intersect(device.online).ifEmpty { setOfNotNull(device.online.firstOrNull()) },
+                    frequencyMode = if (!device.fixedSupported && it.frequencyMode == FrequencyMode.FIXED) {
+                        FrequencyMode.SYSTEM
+                    } else it.frequencyMode,
+                    lastRun = it.lastRun.takeIf { _ -> it.benchmarkDevice == device },
+                )
+            }
+            device
+        } else null
+        val recoveryMessage = recovery.getOrThrow()
+        if (cpu?.voltagePlanSupported == false) {
+            _state.update {
+                it.copy(plan = null, error = recoveryMessage)
+            }
+            return@launchOperation
         }
         try {
-            updatePlan(backend.read())
+            val plan = backend.read()
+            if (plan.sm8850) {
+                require(plan.bootId == cpu?.bootId) { "启动 ID 已改变，请刷新电压计划" }
+            }
+            updatePlan(plan)
             if (recoveryMessage != null) _state.update { it.copy(error = recoveryMessage) }
         } catch (e: CancellationException) {
             throw e
@@ -169,14 +320,14 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun enableCdt() {
         val plan = _state.value.plan ?: return
-        if (plan.state != PlanState.STOCK_UNMODIFIED) return
+        if (plan.state != PlanState.STOCK_UNMODIFIED || !plan.cdtFlashSupported) return
         if (_state.value.cdtUncertain) return
         launchOperation(Operation.WRITING_CDT, "正在备份原厂 CDT 并写入 Key 7 = 1…") {
             applyCdtResult(backend.enableCdt(plan.bootId), RebootPrompt.ENABLED_CDT)
         }
     }
 
-    fun restoreCdt(fallbackClean: Boolean = false) {
+    fun restoreCdt(fallbackClean: Boolean = false, source: Uri? = null) {
         val state = _state.value
         if (state.cdtUncertain) return
         val plan = state.plan
@@ -187,8 +338,9 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(pendingRestoreNoBackup = false) }
         launchOperation(Operation.WRITING_CDT, "正在还原 CDT 分区并逐字节校验…") {
             try {
-                applyCdtResult(backend.restoreCdt(bootId, fallbackClean), RebootPrompt.RESTORED_CDT)
-            } catch (_: MissingCdtBackupException) {
+                applyCdtResult(backend.restoreCdt(bootId, fallbackClean, source), RebootPrompt.RESTORED_CDT)
+            } catch (e: MissingCdtBackupException) {
+                if (isSm8850) throw IllegalStateException("未找到这台设备的完整原厂 CDT 备份，无法还原", e)
                 _state.update { it.copy(pendingRestoreNoBackup = true) }
             }
         }
@@ -228,13 +380,13 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun applyPreset(cores: Set<Int>) = _state.update { state ->
         if (state.operation != null) return@update state
-        val available = cores.intersect(state.plan?.online.orEmpty())
+        val available = cores.intersect(state.benchmarkOnline)
         if (available.isEmpty()) return@update state
         state.copy(cores = available, threads = available.size.toString())
     }
 
     fun toggleCore(core: Int) = _state.update { state ->
-        if (state.operation != null || core !in state.plan?.online.orEmpty()) return@update state
+        if (state.operation != null || core !in state.benchmarkOnline) return@update state
         val selected = if (core in state.cores) state.cores - core else state.cores + core
         val threads = state.threads.toIntOrNull()
         state.copy(
@@ -271,29 +423,37 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun startLoad() {
         val snapshot = _state.value
-        val device = snapshot.plan ?: return
         val config = snapshot.config ?: return
-        if (!device.online.containsAll(config.cores)) return
+        if (!snapshot.benchmarkOnline.containsAll(config.cores)) return
+        val plan = snapshot.plan
+        val cpu = snapshot.benchmarkDevice ?: plan?.let {
+            BenchmarkDevice(it.bootId, it.online, it.current.frequenciesByDomain(), fixedSupported = true)
+        } ?: return
+
+        suspend fun verifyInputs() {
+            if (snapshot.benchmarkDevice != null) {
+                check(backend.readBenchmarkDevice() == cpu) { "设备频点或在线核心已变化，请刷新后重试" }
+            }
+            if (plan != null) {
+                val current = backend.read()
+                updatePlan(current)
+                check(current.bootId == cpu.bootId && current.bootId == plan.bootId &&
+                    current.state == plan.state && current.current == plan.current &&
+                    current.online.containsAll(config.cores)) { "电压计划或在线核心已变化，请刷新后重试" }
+            }
+        }
+
         launchOperation(Operation.LOADING, "正在准备压测…") {
             val session = LoadControl()
             control = session
             try {
-                val fresh = backend.read()
-                updatePlan(fresh)
-                check(
-                    fresh.bootId == device.bootId && fresh.state == device.state &&
-                        fresh.current == device.current && fresh.online.containsAll(config.cores),
-                ) { "电压计划或在线核心已变化，请刷新后重试" }
+                verifyInputs()
                 val thermalStart = thermal?.currentThermalStatus
-                val stats = runTimedLoad(fresh, config, session) ?: return@launchOperation
+                val stats = runTimedLoad(cpu, config, session, allowExtraFrequencies = snapshot.benchmarkDevice != null)
+                    ?: return@launchOperation
                 val thermalEnd = thermal?.currentThermalStatus
-                val after = backend.read()
-                updatePlan(after)
-                check(
-                    after.bootId == fresh.bootId && after.current == fresh.current &&
-                        after.state == fresh.state && after.online.containsAll(config.cores),
-                ) { "压测期间电压计划或在线核心发生变化，结果未保留" }
-                val run = LoadRun(config, fresh.current, stats, thermalStart, thermalEnd)
+                verifyInputs()
+                val run = LoadRun(config, plan?.current.orEmpty(), stats, thermalStart, thermalEnd)
                 _state.update { it.copy(lastRun = run) }
             } finally {
                 control = null
@@ -379,10 +539,15 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
         _state.value.gameSession?.stopped = true
     }
 
-    private suspend fun runTimedLoad(device: DevicePlan, config: LoadConfig, session: LoadControl): LoadStats? {
+    private suspend fun runTimedLoad(
+        device: BenchmarkDevice,
+        config: LoadConfig,
+        session: LoadControl,
+        allowExtraFrequencies: Boolean,
+    ): LoadStats? {
         var firstPolicy: String? = null
         var ticks = 0
-        return backend.runLoad(device, config, session) { line ->
+        return backend.runLoad(device, config, session, allowExtraFrequencies) { line ->
             if (line.startsWith("PROGRESS ")) {
                 val policy = line.substringAfter(' ').substringBefore(' ')
                 // The worker emits one line per active policy each second.

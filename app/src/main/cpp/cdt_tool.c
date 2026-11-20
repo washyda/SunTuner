@@ -554,6 +554,64 @@ static const char *detect_boot_cdt_state(platform_hint_t *hint) {
     return "unknown";
 }
 
+/* The legacy layout is used only to recognize images written by earlier builds. */
+static int edit_v6_key7(const uint8_t *orig, size_t part_len, const cdt_parsed_t *parsed,
+                        uint8_t value, uint8_t *img, int legacy_layout) {
+    const size_t header = parsed->descs[0].offset;
+    const size_t key_start = header + 7;
+    const size_t growth = parsed->has_key7 ? 0 : 2;
+    if (growth && parsed->key_count == UINT8_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    const size_t insert = key_start + (size_t)parsed->key_count * 2;
+    size_t end = header + parsed->descs[0].size;
+    for (int i = 1; i < parsed->block_count; i++) {
+        const cdt_desc_t *block = &parsed->descs[i];
+        if (!block->size) continue;
+        const size_t block_end = (size_t)block->offset + block->size;
+        if (!legacy_layout) {
+            if (block->offset < end + growth && block_end > header) {
+                errno = ENOSPC;
+                return -1;
+            }
+            continue;
+        }
+        for (int j = 0; j < i; j++) {
+            const cdt_desc_t *previous = &parsed->descs[j];
+            if (previous->size && block->offset < (size_t)previous->offset + previous->size &&
+                previous->offset < block_end) {
+                errno = EINVAL;
+                return -1;
+            }
+        }
+        if (block_end > end) end = block_end;
+    }
+    if (growth && (end + 2 > CDT_MAX_PAYLOAD || end + 2 > part_len || orig[end] || orig[end + 1])) {
+        errno = ENOSPC;
+        return -1;
+    }
+    if (!img) return 0;
+    memcpy(img, orig, part_len);
+    if (parsed->has_key7) {
+        for (size_t i = 0; i < parsed->key_count; i++) {
+            if (parsed->keys[i] == CDT_SLT_KEY) img[key_start + i * 2 + 1] = value;
+        }
+        return 0;
+    }
+    memmove(img + insert + 2, img + insert, end - insert);
+    img[header + 6] = parsed->key_count + 1;
+    img[insert] = CDT_SLT_KEY;
+    img[insert + 1] = value;
+    write_u16_le(img + CDT_HEADER_SIZE + 2, parsed->descs[0].size + 2);
+    for (int i = 1; legacy_layout && i < parsed->block_count; i++) {
+        if (parsed->descs[i].size) {
+            write_u16_le(img + CDT_HEADER_SIZE + i * 4, parsed->descs[i].offset + 2);
+        }
+    }
+    return 0;
+}
+
 static int build_cdt_with_key7(
     const uint8_t *orig,
     size_t part_len,
@@ -588,6 +646,15 @@ static int build_cdt_with_key7(
         img[24] = 1;
         img[25] = CDT_SLT_KEY;
         img[26] = key7_value;
+        *out_img = img;
+        return 0;
+    }
+
+    if (set_key7 && parsed->version == 6) {
+        if (edit_v6_key7(orig, part_len, parsed, key7_value, img, 0) != 0) {
+            free(img);
+            return -1;
+        }
         *out_img = img;
         return 0;
     }
@@ -692,13 +759,8 @@ static const char *disk_state_str(disk_state_t s) {
     }
 }
 
-static const char *backup_status(const char *path, const uint8_t *current, size_t len) {
-    uint8_t *backup = NULL;
-    size_t backup_len = 0;
-    if (!path) return "missing";
-    if (read_file_exact(path, &backup, &backup_len) != 0)
-        return errno == ENOENT ? "missing" : "invalid";
-
+static const char *compare_backup(const uint8_t *backup, size_t backup_len,
+                                  const uint8_t *current, size_t len) {
     cdt_parsed_t parsed;
     const char *status = "invalid";
     if (backup_len == len && parse_cdt(backup, backup_len, &parsed) == 0 &&
@@ -721,11 +783,26 @@ static const char *backup_status(const char *path, const uint8_t *current, size_
                 uint8_t *expected = NULL;
                 if (build_cdt_with_key7(backup, len, &parsed, &hint, 1, 1, &expected) == 0) {
                     if (memcmp(current, expected, len) == 0) status = "enabled_match";
-                    free(expected);
                 }
+                if (parsed.version == 6 && !parsed.has_key7 && strcmp(status, "mismatch") == 0) {
+                    if (!expected) expected = malloc(len);
+                    if (expected && edit_v6_key7(backup, len, &parsed, 1, expected, 1) == 0 &&
+                        memcmp(current, expected, len) == 0) status = "enabled_match";
+                }
+                free(expected);
             }
         }
     }
+    return status;
+}
+
+static const char *backup_status(const char *path, const uint8_t *current, size_t len) {
+    uint8_t *backup = NULL;
+    size_t backup_len = 0;
+    if (!path) return "missing";
+    if (read_file_exact(path, &backup, &backup_len) != 0)
+        return errno == ENOENT ? "missing" : "invalid";
+    const char *status = compare_backup(backup, backup_len, current, len);
     free(backup);
     return status;
 }
@@ -736,6 +813,9 @@ static void print_disk_status(const uint8_t *buf, size_t len, const char *origin
     printf("CDT_SIZE=%zu\n", len);
     printf("CDT_DISK=%s\n", disk_state_str(parsed.state));
     printf("CDT_BACKUP_STATUS=%s\n", original_status);
+    if (parsed.version == 6 && parsed.state == DISK_STOCK) {
+        printf("CDT_V6_CAN_ENABLE=%d\n", edit_v6_key7(buf, len, &parsed, 1, NULL, 0) == 0);
+    }
     if (parsed.has_key7) {
         printf("CDT_KEY7=%u\n", parsed.key7_val);
     } else {
@@ -860,6 +940,7 @@ static int cmd_enable_with_hint(
 static int cmd_restore_with_hint(
     const char *dev_path,
     const char *backup_path,
+    const char *import_path,
     int allow_fallback_clean,
     const platform_hint_t *override_hint
 ) {
@@ -871,13 +952,14 @@ static int cmd_restore_with_hint(
         return 1;
     }
 
-    if (access(backup_path, F_OK) == 0) {
+    if (import_path || access(backup_path, F_OK) == 0) {
+        const char *source = import_path ? import_path : backup_path;
         uint8_t *bak = NULL;
         size_t bak_len = 0;
-        if (read_file_exact(backup_path, &bak, &bak_len) != 0 || bak_len != cur_len) {
+        if (read_file_exact(source, &bak, &bak_len) != 0 || bak_len != cur_len) {
             free(bak);
             free(cur);
-            fprintf(stderr, "cdt_tool: backup %s size mismatch or unreadable\n", backup_path);
+            fprintf(stderr, "CDT_ERR=restore_image_size\n");
             return 2;
         }
         cdt_parsed_t bak_parsed;
@@ -885,8 +967,26 @@ static int cmd_restore_with_hint(
             (bak_parsed.state != DISK_EMPTY && bak_parsed.state != DISK_STOCK)) {
             free(bak);
             free(cur);
-            fprintf(stderr, "cdt_tool: backup %s is corrupt or not stock\n", backup_path);
+            fprintf(stderr, "CDT_ERR=restore_image_invalid\n");
             return 3;
+        }
+        if (import_path) {
+            const char *import_status = compare_backup(bak, bak_len, cur, cur_len);
+            if (strcmp(import_status, "match") != 0 && strcmp(import_status, "enabled_match") != 0) {
+                free(bak);
+                free(cur);
+                fprintf(stderr, "CDT_ERR=restore_image_mismatch\n");
+                return 3;
+            }
+            const char *stored_status = backup_status(backup_path, bak, bak_len);
+            if (strcmp(stored_status, "mismatch") == 0 ||
+                (strcmp(stored_status, "match") != 0 &&
+                 (save_backup_atomic(backup_path, bak, bak_len) != 0 || sync_parent(backup_path) != 0))) {
+                free(bak);
+                free(cur);
+                fprintf(stderr, "CDT_ERR=restore_backup_conflict\n");
+                return 3;
+            }
         }
         if (memcmp(cur, bak, cur_len) == 0) {
             print_disk_status(cur, cur_len, "match");
@@ -1004,7 +1104,7 @@ static int cmd_selftest(void) {
     free(bak_buf);
 
     /* Restore from backup must return exact zeros. */
-    if (cmd_restore_with_hint(dev, bak, 0, &mtp) != 0) return 1;
+    if (cmd_restore_with_hint(dev, bak, NULL, 0, &mtp) != 0) return 1;
     uint8_t *restored = NULL;
     size_t rlen = 0;
     if (read_file_exact(dev, &restored, &rlen) != 0 || memcmp(restored, zeros, part_size) != 0) {
@@ -1018,11 +1118,11 @@ static int cmd_selftest(void) {
     f = fopen(dev, "wb");
     if (!f || fwrite(enabled, 1, part_size, f) != part_size) return 1;
     fclose(f);
-    if (cmd_restore_with_hint(dev, bak, 0, &mtp) == 0) {
+    if (cmd_restore_with_hint(dev, bak, NULL, 0, &mtp) == 0) {
         fprintf(stderr, "selftest: expected restore without backup/flag to fail\n");
         return 1;
     }
-    if (cmd_restore_with_hint(dev, bak, 1, &mtp) != 0) return 1;
+    if (cmd_restore_with_hint(dev, bak, NULL, 1, &mtp) != 0) return 1;
     if (read_file_exact(dev, &restored, &rlen) != 0 || memcmp(restored, zeros, part_size) != 0) {
         fprintf(stderr, "selftest: clean fallback mismatch\n");
         return 1;
@@ -1052,7 +1152,7 @@ static int cmd_selftest(void) {
         return 1;
     }
     free(m_en);
-    if (cmd_restore_with_hint(dev, bak, 0, &mtp) != 0) return 1;
+    if (cmd_restore_with_hint(dev, bak, NULL, 0, &mtp) != 0) return 1;
     if (read_file_exact(dev, &restored, &rlen) != 0 || memcmp(restored, multi, part_size) != 0) {
         fprintf(stderr, "selftest: multi-block restore mismatch\n");
         return 1;
@@ -1112,12 +1212,13 @@ int main(int argc, char **argv) {
         printf("CDT_RESULT=%s\n", rc == 0 ? "verified" : operation_result);
         return rc;
     }
-    if ((argc == 4 || (argc == 5 && strcmp(argv[4], "--fallback-clean") == 0)) &&
+    if ((argc == 4 || (argc == 5 && strcmp(argv[4], "--fallback-clean") == 0) ||
+         (argc == 6 && strcmp(argv[4], "--from-file") == 0)) &&
         strcmp(argv[1], "restore") == 0) {
-        int rc = cmd_restore_with_hint(argv[2], argv[3], argc == 5, NULL);
+        int rc = cmd_restore_with_hint(argv[2], argv[3], argc == 6 ? argv[5] : NULL, argc == 5, NULL);
         printf("CDT_RESULT=%s\n", rc == 0 ? "verified" : operation_result);
         return rc;
     }
-    fprintf(stderr, "Usage: cdt_tool status <dev> [backup] | backup <dev> <image> | recover <dev> <backup> | enable <dev> <backup> | restore <dev> <backup> [--fallback-clean] | selftest\n");
+    fprintf(stderr, "Usage: cdt_tool status <dev> [backup] | backup <dev> <image> | recover <dev> <backup> | enable <dev> <backup> | restore <dev> <backup> [--fallback-clean|--from-file <image>] | selftest\n");
     return 2;
 }

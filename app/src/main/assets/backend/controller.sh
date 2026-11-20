@@ -85,13 +85,17 @@ lock_frequencies() {
             [ "$khz" = 0 ] || die "未选中 policy$policy 的核心"
         else
             case "$khz" in [1-9][0-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;; *) die "锁频值无效" ;; esac
-            grep -qw "$khz" "$cpu/cpufreq/policy$policy/scaling_available_frequencies" ||
-                die "policy$policy 不支持 $khz kHz"
+            if ! grep -qw "$khz" "$cpu/cpufreq/policy$policy/scaling_available_frequencies"; then
+                is_sm8850 && sm8850_boost_frequencies "$policy" | grep -qx "$khz" ||
+                    die "policy$policy 不支持 $khz kHz"
+            fi
         fi
     done
     [ ! -d "$modules/sm8750_stress_qos" ] || die "已有其他任务正在使用锁频模块"
     : > "$session/stress-qos"
-    cp "$bundle/sm8750_stress_qos.ko" "$work/"
+    local asset
+    asset=$(stress_qos_asset) || die "当前内核缺少匹配的锁频模块"
+    cp "$bundle/$asset" "$work/sm8750_stress_qos.ko"
     load_owned sm8750_stress_qos "pdp0_khz=$freq0" "pdp1_khz=$freq1"
 }
 
@@ -116,6 +120,77 @@ cleanup() {
     done
     [ -z "$work" ] || rm -rf -- "$work" || rc=1
     exit "$rc"
+}
+
+is_sm8850() {
+    case "$(getprop ro.soc.model)" in
+        [sS][mM]8850) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_sm8850_policies() {
+    [ "$(cat "$cpu/cpufreq/policy0/related_cpus")" = '0 1 2 3 4 5' ] &&
+        [ "$(cat "$cpu/cpufreq/policy6/related_cpus")" = '6 7' ] ||
+        die "当前 SM8850 的 CPU 簇布局与 6+2 适配不匹配"
+}
+
+# Both SM8850 assets use the Android 16 / 6.12 GKI generation 6 ABI and 4 KB pages.
+sm8850_kernel_supported() {
+    case "$(uname -r)" in
+        6.12.*-android16-6-*-4k|6.12.*-android16-6-*-4k-*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+stress_qos_asset() {
+    if is_sm8850; then
+        sm8850_kernel_supported &&
+            [ -r "$bundle/sm8850_stress_qos.ko" ] || return 1
+        printf '%s\n' sm8850_stress_qos.ko
+    else
+        printf '%s\n' sm8750_stress_qos.ko
+    fi
+}
+
+sm8850_plan_supported() {
+    sm8850_kernel_supported && [ -r "$bundle/sm8850_scmi_plan_ro.ko" ]
+}
+
+sm8850_cdt_ready() {
+    [ "$state" = STOCK_UNMODIFIED ] && [ "$cdt_v6_can_enable" = 1 ] &&
+        [ "$boot_cdt" = not_found ] && stock_baseline_candidate
+}
+
+sm8850_boost_frequencies() {
+    local dir="$cpu/cpufreq/policy$1" max points freq
+    [ -r "$dir/scaling_boost_frequencies" ] || return 0
+    max=$(cat "$dir/cpuinfo_max_freq") || return 0
+    points=$(cat "$dir/scaling_boost_frequencies") || return 0
+    for freq in $points; do
+        if [ "$freq" -le "$max" ]; then printf '%s\n' "$freq"; fi
+    done
+    return 0
+}
+
+sm8850_cpu_frequencies() {
+    check_sm8850_policies
+    local policy frequencies boost
+    for policy in 0 6; do
+        frequencies=$(cat "$cpu/cpufreq/policy$policy/scaling_available_frequencies") ||
+            die "无法读取 policy$policy 频点表"
+        boost=$(sm8850_boost_frequencies "$policy" | tr '\n' ' ')
+        printf 'POLICY %s %s %s\n' "$policy" "$frequencies" "$boost"
+    done
+}
+
+read_sm8850_frequencies() {
+    is_sm8850 || die "需要 SM8850 平台"
+    printf 'BOOT %s\n' "$(cat "$boot_file")"
+    printf 'ONLINE %s\n' "$(cat "$cpu/online")"
+    if stress_qos_asset >/dev/null; then printf 'FIXED 1\n'; else printf 'FIXED 0\n'; fi
+    if sm8850_plan_supported; then printf 'VOLTAGE 1\n'; else printf 'VOLTAGE 0\n'; fi
+    sm8850_cpu_frequencies
 }
 
 check_firmware() {
@@ -186,7 +261,7 @@ inspect_state() {
     boot_cdt=unknown
     boot_platform_info=unknown
     read_cdt_status "$work/cdt.status"
-    probe_apns_slot
+    if is_sm8850; then apns_slot=unknown; else probe_apns_slot; fi
     classify_state
 }
 
@@ -194,12 +269,14 @@ read_cdt_status() {
     cdt_disk=unknown
     cdt_key7=absent
     cdt_platform=none
+    cdt_v6_can_enable=0
     cdt_backup_status=missing
     while IFS='=' read -r k v; do
         case "$k" in
             CDT_DISK) cdt_disk=$v ;;
             CDT_KEY7) cdt_key7=$v ;;
             CDT_PLATFORM) cdt_platform=$v ;;
+            CDT_V6_CAN_ENABLE) cdt_v6_can_enable=$v ;;
             CDT_BACKUP_STATUS) cdt_backup_status=$v ;;
             BOOT_CDT) boot_cdt=$v ;;
             BOOT_PLATFORM_INFO) boot_platform_info=$v ;;
@@ -244,12 +321,18 @@ maybe_persist_stock_baseline() {
         return 0
     fi
     rm -f -- "$candidate"
+    if is_sm8850 && [ "$action" = cdt_enable ]; then die "无法保存刷入前的电压计划"; fi
     printf 'WARN 无法保存刷入前的电压计划\n' >&2
 }
 
 load_scmi_module() {
-    [ -r "$bundle/sm8750_scmi_plan_ro.ko" ] || die "缺少 sm8750_scmi_plan_ro.ko"
-    cp "$bundle/sm8750_scmi_plan_ro.ko" "$work/sm8750_scmi_plan_ro.ko"
+    local asset=sm8750_scmi_plan_ro.ko
+    if is_sm8850; then
+        sm8850_plan_supported || die "当前 SM8850 内核缺少匹配的电压读表模块"
+        asset=sm8850_scmi_plan_ro.ko
+    fi
+    [ -r "$bundle/$asset" ] || die "缺少 $asset"
+    cp "$bundle/$asset" "$work/sm8750_scmi_plan_ro.ko"
     load_owned sm8750_scmi_plan_ro
     owned_plan=1
 }
@@ -257,6 +340,9 @@ load_scmi_module() {
 report() {
     inspect_state
     plan > "$work/current"
+    if is_sm8850; then
+        validate_current_plan
+    fi
     maybe_persist_stock_baseline "$work/current"
     prepare_report
     emit_report
@@ -342,22 +428,40 @@ prepare_report() {
 }
 
 plan_frequencies() {
-    awk -F, '
+    local sm8850=0
+    if is_sm8850; then sm8850=1; fi
+    awk -F, -v sm8850="$sm8850" '
         /^[01],/ {
             if (NF != 7) exit 1
             for (i = 1; i <= NF; i++) if ($i !~ /^[0-9]+$/ || $i > 2147483647) exit 1
             if ($2 != count[$1] || $2 != $7 || $4 <= 0 || $6 <= previous[$1]) exit 1
+            if (sm8850) {
+                coeff = $1 == 0 ? 100 : 150
+                mv = int(sqrt($4 * 1e9 / (coeff * $6)) / 4 + 0.5) * 4
+                if (int(coeff * $6 * mv * mv / 1e9) != $4) exit 1
+            }
             count[$1]++
             previous[$1] = $6
             print $1, $2, $6
         }
-        END { if (count[0] != 16 || count[1] != 16) exit 1 }
+        END {
+            if (sm8850 ? (count[0] < 1 || count[1] < 1) : (count[0] != 16 || count[1] != 16)) exit 1
+        }
     ' "$1"
 }
 
-capture_cdt_plan() {
-    plan > "$work/current" || die "读取 SCMI 计划失败，未开始写入 CDT"
-    plan_frequencies "$work/current" >"$work/current.freq" || die "SCMI 计划无效，未开始写入 CDT"
+validate_current_plan() {
+    plan_frequencies "$work/current" > "$work/current.freq" || die "SCMI 电压计划校验失败"
+    if is_sm8850; then
+        sm8850_cpu_frequencies > "$work/cpu.freq"
+        awk '
+            FNR == NR { plan[$1, $3] = 1; next }
+            {
+                domain = $2 == 0 ? 0 : 1
+                for (i = 3; i <= NF; i++) if (!plan[domain, $i]) exit 1
+            }
+        ' "$work/current.freq" "$work/cpu.freq" || die "SM8850 系统频点与 SCMI 电压计划不匹配"
+    fi
 }
 
 emit_report() {
@@ -380,6 +484,15 @@ emit_report() {
         "$boot" "$state" "$cdt_disk" "$cdt_key7" "$has_backup" "$cdt_platform" \
         "$boot_cdt" "$boot_platform_info" "$apns_slot" "$online" "$baseline_source"
     printf 'SLT_SUPPORTED %s\nSLT_DOMAINS %s\n' "$slt_supported" "$slt_domains"
+    if is_sm8850; then
+        flash_supported=0
+        if sm8850_cdt_ready; then flash_supported=1; fi
+        printf 'PLAN_MODEL SM8850\nCDT_FLASH_SUPPORTED %s\n' "$flash_supported"
+        if [ "$(sed -n '1s/^# boot_id=//p' "$persistent/stock-baseline.csv" 2>/dev/null || true)" = "$boot" ] &&
+            [ "$state" = CDT_WRITTEN ]; then
+            printf 'CDT_PENDING_REBOOT 1\n'
+        fi
+    fi
 
     if [ "$baseline_source" = persisted ]; then
         printf 'BEGIN baseline\n'
@@ -405,6 +518,10 @@ cdt_error() {
             CDT_ERR=unchanged) printf 'ERROR 写入未开始，CDT 未更改\n' >&2 ;;
             CDT_ERR=backup_mismatch) printf 'ERROR 当前 CDT 与原厂备份不一致，请先还原分区。\n' >&2 ;;
             CDT_ERR=backup_invalid) printf 'ERROR 原厂 CDT 备份无效，已停止写入。\n' >&2 ;;
+            CDT_ERR=restore_image_size) printf 'ERROR CDT 镜像无法读取，或与分区大小不一致。\n' >&2 ;;
+            CDT_ERR=restore_image_invalid) printf 'ERROR CDT 镜像损坏或不是原厂格式。\n' >&2 ;;
+            CDT_ERR=restore_image_mismatch) printf 'ERROR 所选原厂镜像与当前 CDT 不匹配。\n' >&2 ;;
+            CDT_ERR=restore_backup_conflict) printf 'ERROR 无法保存所选备份，或它与已有原厂备份不一致。\n' >&2 ;;
             CDT_ERR=rollback_failed:*|CDT_ERR=recovery_failed:*)
                 printf 'ERROR 无法确认 CDT 已恢复，恢复记录已保留。请勿重启，先刷新重试恢复。\n' >&2
                 printf 'ERROR %s\n' "$detail" >&2 ;;
@@ -433,6 +550,10 @@ run_cdt_operation() {
     "$work/cdt_tool" "$verb" "$device" "$persistent/cdt-orig.bin" "$@" >"$work/cdt.out" 2>"$work/cdt.err" || native_rc=$?
     cat "$work/cdt.out"
     if [ "$native_rc" -ne 0 ]; then
+        if [ "${restore_marker_added:-0}" = 1 ] &&
+            grep -Eq '^CDT_RESULT=(unchanged|rolled_back)$' "$work/cdt.out"; then
+            rm -f -- "$persistent/cdt-restore.boot" || true
+        fi
         if grep -q '^CDT_ERR=no_backup$' "$work/cdt.err"; then
             die "CDT_NO_BACKUP 未找到原始 CDT 备份，若需移除 Key 7 恢复出厂请二次确认"
         fi
@@ -623,6 +744,38 @@ print_cdt_write_log() {
     '
 }
 
+read_sm8850_perf() {
+    if ! sm8850_plan_supported; then
+        printf 'SCMI_PERF=kernel_not_supported\n'
+        return 1
+    fi
+    if [ -d "$modules/sm8750_scmi_plan_ro" ]; then
+        printf 'SCMI_PERF=module_busy\n'
+        return 1
+    fi
+    if ! cp "$bundle/sm8850_scmi_plan_ro.ko" "$work/sm8750_scmi_plan_ro.ko" ||
+        ! insmod "$work/sm8750_scmi_plan_ro.ko"; then
+        printf 'SCMI_PERF=module_load_failed\n'
+        return 1
+    fi
+    owned_plan=1
+    local result=0
+    if (plan) > "$work/scmi_perf.csv"; then
+        printf 'SCMI_PERF=ok\n'
+        cat "$work/scmi_perf.csv"
+    else
+        printf 'SCMI_PERF=read_failed\n'
+        result=1
+    fi
+    if rmmod sm8750_scmi_plan_ro; then
+        owned_plan=0
+    else
+        printf 'SCMI_PERF_UNLOAD=failed\n'
+        result=1
+    fi
+    return "$result"
+}
+
 collect_diagnostics() {
     local cdt_dev path prop value attribute policy
     local cdt_block= cdt_parent= cdt_sysfs= parent_sysfs=
@@ -676,10 +829,13 @@ collect_diagnostics() {
     printf 'CPU_ONLINE=%s\n' "$value"
     for policy in "$cpu"/cpufreq/policy*; do
         [ -d "$policy" ] || continue
-        for attribute in related_cpus scaling_driver scaling_available_frequencies; do
+        for attribute in related_cpus scaling_driver scaling_available_frequencies cpuinfo_max_freq scaling_max_freq scaling_boost_frequencies; do
             value=$(cat "$policy/$attribute" 2>/dev/null) || continue
             printf '%s.%s=%s\n' "${policy##*/}" "$attribute" "$value"
         done
+        if [ -r "$policy/stats/time_in_state" ]; then
+            printf '%s.time_in_state=present\n' "${policy##*/}"
+        fi
     done
     if [ -d /sys/bus/scmi_protocol ]; then
         printf 'SCMI_BUS=present\n'
@@ -732,6 +888,17 @@ collect_diagnostics() {
     fi
 }
 
+if [ "$action" = crash_logs ]; then
+    exec sh "$bundle/crash_logs.sh" "$@"
+fi
+
+if [ "$action" = read_frequencies ]; then
+    [ "$#" = 0 ] || die "频点读取参数无效"
+    [ "$(id -u)" = 0 ] || die "需要 Root 权限"
+    read_sm8850_frequencies
+    exit 0
+fi
+
 if [ "$action" = diagnostics ]; then
     [ "$#" = 0 ] || die "诊断参数无效"
     [ "$(id -u)" = 0 ] || die "需要 Root 权限"
@@ -739,9 +906,13 @@ if [ "$action" = diagnostics ]; then
     exec 9>"$root/lock"
     flock -n 9 9>&9 || die "有另一个降压或烤机任务正在运行"
     work=$(mktemp -d "$root/diagnostics.XXXXXXXX")
-    trap 'rm -rf -- "$work"' EXIT
+    trap 'if [ "$owned_plan" = 1 ]; then rmmod sm8750_scmi_plan_ro 2>/dev/null || true; fi; rm -rf -- "$work"' EXIT
     trap 'exit 143' TERM HUP INT
     collect_diagnostics
+    if is_sm8850; then
+        printf '\n[cpu scmi perf probe]\n'
+        read_sm8850_perf || true
+    fi
     exit 0
 fi
 
@@ -781,18 +952,22 @@ case "$action" in
         prepare_cdt_tool
         cdt_dev=$(find_cdt_dev) || die "未找到 CDT 分区"
         if [ "$action" = cdt_restore ]; then
-            extra_arg=
-            if [ "$#" = 2 ] && [ "$2" = "--fallback-clean" ]; then
-                extra_arg=--fallback-clean
-            elif [ "$#" -ne 1 ]; then
-                die "还原参数无效"
-            fi
+            shift
+            case "$#:${1:-}" in
+                0:) ;;
+                1:--fallback-clean) ! is_sm8850 || die "SM8850 需要原厂 CDT 完整备份才能还原" ;;
+                2:--from-file) [ -f "$2" ] || die "无法打开所选 CDT 镜像" ;;
+                *) die "还原参数无效" ;;
+            esac
             recover_cdt_if_pending
             cdt_stage restore_and_verify
             # The running plan can still be from the pre-restore CDT until the next boot.
-            printf '%s\n' "$boot" > "$persistent/cdt-restore.boot" ||
-                printf 'WARN 无法保存本次还原的启动 ID\n' >&2
-            run_cdt_operation restore "$cdt_dev" ${extra_arg:+"$extra_arg"}
+            if [ "$(cat "$persistent/cdt-restore.boot" 2>/dev/null || true)" != "$boot" ]; then
+                printf '%s\n' "$boot" > "$persistent/cdt-restore.boot" ||
+                    die "无法记录本次还原的启动 ID"
+                restore_marker_added=1
+            fi
+            run_cdt_operation restore "$cdt_dev" "$@"
         elif [ "$action" = cdt_recover ]; then
             [ "$#" -le 1 ] || die "恢复参数无效"
             recover_cdt_if_pending
@@ -834,6 +1009,7 @@ case "$action" in
         case "$workload" in mixed|int|fp) ;; *) die "算力测试类型无效" ;; esac
         case "$1" in [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) die "核心掩码无效" ;; esac
         [ "$1" -le 255 ] || die "核心掩码无效"
+        if is_sm8850; then check_sm8850_policies; fi
         case "$4" in
             max) set_performance "$1" ;;
             fixed) lock_frequencies "$1" "$5" "$6"; set_performance "$1" ;;
@@ -841,12 +1017,14 @@ case "$action" in
             *) die "烤机调频模式无效" ;;
         esac
 
-        prepare_cdt_tool
-        inspect_state
+        if ! is_sm8850; then
+            prepare_cdt_tool
+            inspect_state
+        fi
         cp "$bundle/load" "$work/load"
         chmod 700 "$work/load"
         : > "$work/pvc.out"
-        if [ "$3" -ge 6 ] && [ -r "$bundle/sm8750_pvc_corr_ro.ko" ]; then
+        if ! is_sm8850 && [ "$3" -ge 6 ] && [ -r "$bundle/sm8750_pvc_corr_ro.ko" ]; then
             prev_t0=$(prev_pvc_t0_ns)
             run_pvc_sampler "$work/pvc.ready" "$work/load.done" "$prev_t0" "$work/pvc.out" \
                 "$bundle/sm8750_pvc_corr_ro.ko" "$work/sm8750_pvc_corr_ro.ko" &
@@ -880,8 +1058,12 @@ case "$action" in
         cat "$work/cdt.status" >&2
         printf 'CDT_PRE_STATE=%s\n' "$state" >&2
         [ "$state" != CDT_RECOVERY_REQUIRED ] || die "当前 CDT 与原厂备份不一致，请先还原分区"
+        if is_sm8850; then
+            sm8850_cdt_ready || die "当前 CDT 布局或启动状态不满足安全写入条件"
+        fi
         cdt_stage capture_plan
-        capture_cdt_plan
+        plan > "$work/current" || die "读取 SCMI 计划失败，未开始写入 CDT"
+        validate_current_plan
         maybe_persist_stock_baseline "$work/current"
         cdt_stage write_and_verify
         run_cdt_operation enable "$cdt_dev" ;;

@@ -39,7 +39,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import io.washy.sm8750.tuner.CORE_PRESETS
 import io.washy.sm8750.tuner.FrequencyMode
-import io.washy.sm8750.tuner.Level
 import io.washy.sm8750.tuner.Operation
 import io.washy.sm8750.tuner.ScreenState
 import io.washy.sm8750.tuner.WorkloadKind
@@ -61,7 +60,7 @@ internal fun BenchmarkScreen(
     onStop: () -> Unit,
 ) {
     val running = state.operation == Operation.LOADING
-    val editable = state.operation == null && state.plan != null
+    val editable = state.operation == null && state.benchmarkOnline.isNotEmpty()
     val config = state.config
     var showCustomCores by rememberSaveable { mutableStateOf(false) }
 
@@ -85,7 +84,7 @@ internal fun BenchmarkScreen(
                     CORE_PRESETS.chunked(2).forEach { pair ->
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             pair.forEach { preset ->
-                                val available = preset.cores.intersect(state.plan?.online.orEmpty())
+                                val available = preset.cores.intersect(state.benchmarkOnline)
                                 FilterChip(
                                     selected = available.isNotEmpty() && state.cores == available,
                                     onClick = { onPreset(preset.cores) },
@@ -105,7 +104,7 @@ internal fun BenchmarkScreen(
                                         FilterChip(
                                             selected = core in state.cores,
                                             onClick = { onCore(core) },
-                                            enabled = editable && core in state.plan.online,
+                                            enabled = editable && core in state.benchmarkOnline,
                                             label = { Text("C$core") },
                                             modifier = Modifier.weight(1f),
                                         )
@@ -154,11 +153,11 @@ internal fun BenchmarkScreen(
                         val domains = state.cores.map(::domainFor).distinct().sorted()
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             domains.forEach { domain ->
-                                val levels = state.plan?.current.orEmpty().filter { it.domain == domain }
+                                val levels = state.benchmarkFrequencies[domain].orEmpty()
                                 if (levels.isNotEmpty()) {
                                     FrequencyPicker(
                                         domain,
-                                        config?.targets?.get(domain) ?: state.fixedFrequencies[domain] ?: levels.last().khz,
+                                        config?.targets?.get(domain) ?: state.fixedFrequencies[domain] ?: levels.last(),
                                         levels,
                                         editable,
                                         onFrequency,
@@ -239,7 +238,7 @@ internal fun BenchmarkScreen(
 }
 
 @Composable
-private fun FrequencyPicker(domain: Int, selected: Int, levels: List<Level>, enabled: Boolean, choose: (Int, Int) -> Unit) {
+private fun FrequencyPicker(domain: Int, selected: Int, levels: List<Int>, enabled: Boolean, choose: (Int, Int) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         OutlinedButton(enabled = enabled, onClick = { expanded = true }) {
@@ -248,8 +247,8 @@ private fun FrequencyPicker(domain: Int, selected: Int, levels: List<Level>, ena
         DropdownMenu(expanded, onDismissRequest = { expanded = false }) {
             for (level in levels.asReversed()) {
                 DropdownMenuItem(
-                    text = { Text("${decimal(level.khz / 1000.0)} MHz", style = MaterialTheme.typography.bodyMedium.tabular()) },
-                    onClick = { choose(domain, level.khz); expanded = false },
+                    text = { Text("${decimal(level / 1000.0)} MHz", style = MaterialTheme.typography.bodyMedium.tabular()) },
+                    onClick = { choose(domain, level); expanded = false },
                 )
             }
         }

@@ -61,10 +61,12 @@ internal fun VoltageScreen(
     onEnableCdt: () -> Unit,
     onManualSlt: (Int) -> Unit,
     onRestoreCdt: () -> Unit,
+    onRestoreCdtFromFile: () -> Unit,
     onRebootNow: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val device = state.plan
+    val currentLevels = device?.current.orEmpty()
     val partition = state.cdtPartition
     val cdtState = when {
         state.cdtUncertain -> null
@@ -79,7 +81,7 @@ internal fun VoltageScreen(
         AlertDialog(
             onDismissRequest = { confirmEnable = false },
             title = { Text("开启降压") },
-            text = { Text("将先备份原厂分区，再写入 CDT 降压标志并校验，重启后生效。") },
+            text = { Text("将先备份原厂分区，再写入 CDT 降压标志并校验。重启后可检查电压计划是否变化。") },
             confirmButton = { Button(onClick = { confirmEnable = false; onEnableCdt() }) { Text("写入 CDT") } },
             dismissButton = { TextButton(onClick = { confirmEnable = false }) { Text("取消") } },
         )
@@ -91,10 +93,13 @@ internal fun VoltageScreen(
             onDismissRequest = { confirmRestore = false },
             title = { Text("还原 CDT 分区") },
             text = {
-                Text(
-                    if (recoveryRequired) "当前分区与原厂备份不一致。将写回原厂备份并校验整个分区。"
-                    else "将恢复 CDT 分区并校验，重启后回到原厂电压。"
-                )
+                Column {
+                    Text(
+                        if (recoveryRequired) "当前分区与原厂备份不一致。将写回原厂备份并校验整个分区。"
+                        else "可使用自动备份，或选择此前从本机导出的原厂镜像。所选镜像通过校验后会直接写入。"
+                    )
+                    TextButton(onClick = { confirmRestore = false; onRestoreCdtFromFile() }) { Text("从镜像文件还原") }
+                }
             },
             confirmButton = { Button(onClick = { confirmRestore = false; onRestoreCdt() }) { Text("还原分区") } },
             dismissButton = { TextButton(onClick = { confirmRestore = false }) { Text("取消") } },
@@ -122,11 +127,15 @@ internal fun VoltageScreen(
                 onRebootNow = onRebootNow,
             )
         }
-        if (device == null) {
+        if (currentLevels.isEmpty()) {
             if (cdtState != null && state.operation == null) {
                 item {
                     Text(
-                        "当前电压表读取失败，可刷新重试。",
+                        if (state.benchmarkDevice?.voltagePlanSupported == false) {
+                            "当前 SM8850 内核缺少匹配的电压读表模块。"
+                        } else {
+                            "当前电压表不可用，可刷新重试。"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -142,7 +151,7 @@ internal fun VoltageScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "当前电压计划",
+                    if (device?.sm8850 == true) "电压计划 · SCMI 估算" else "当前电压计划",
                     modifier = Modifier.weight(1f),
                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
                 )
@@ -153,23 +162,23 @@ internal fun VoltageScreen(
             }
         }
 
-        val comparisonBaseline = device.baseline.takeIf {
-            device.baselineSource == BaselineSource.PERSISTED &&
-                (device.state == PlanState.CDT_WRITTEN || device.state == PlanState.EXTERNAL_RUNTIME ||
-                    device.manualSltDomains.isNotEmpty())
-        }
+        val comparisonBaseline = device?.takeIf {
+            it.baselineSource == BaselineSource.PERSISTED &&
+                (it.state == PlanState.CDT_WRITTEN || it.state == PlanState.EXTERNAL_RUNTIME ||
+                    it.manualSltDomains.isNotEmpty())
+        }?.baseline
 
         val visibleDomains = if (clusterFilter in 0..1) listOf(clusterFilter) else listOf(0, 1)
-        val canRunSlt = state.operation == null && !state.cdtUncertain && (0..7).all { it in device.online } &&
+        val canRunSlt = state.operation == null && !state.cdtUncertain && (0..7).all { it in device?.online.orEmpty() } &&
             cdtState != PlanState.CDT_RECOVERY_REQUIRED && cdtState != PlanState.CORRUPT_CDT
         for (domain in visibleDomains) {
             item(key = "cluster_card_$domain") {
                 ClusterVoltageCard(
                     domain = domain,
-                    currentLevels = device.current.filter { it.domain == domain },
+                    currentLevels = currentLevels.filter { it.domain == domain },
                     baselineLevels = comparisonBaseline?.filter { it.domain == domain }
                         ?.takeIf { levels -> levels.any { it.millivolts != null } },
-                    sltAction = if (device.manualSltSupported) {
+                    sltAction = if (device?.manualSltSupported == true) {
                         {
                             OutlinedButton(onClick = { onManualSlt(domain) }, enabled = canRunSlt) {
                                 Text("手动 SLT")
@@ -177,7 +186,7 @@ internal fun VoltageScreen(
                         }
                     } else null,
                     sltStatus = when (val changed = state.sltChanges[domain]) {
-                        null -> if (domain in device.manualSltDomains) "本次启动已手动 SLT" else null
+                        null -> if (domain in device?.manualSltDomains.orEmpty()) "本次启动已手动 SLT" else null
                         0 -> "SLT 已应答 · 电压计划无变化"
                         else -> "SLT 已应答 · $changed / 16 档变化"
                     },
@@ -232,6 +241,24 @@ private fun VoltageClusterSelect(selectedCluster: Int, onSelect: (Int) -> Unit) 
     }
 }
 
+private fun sm8850CdtState(device: DevicePlan): Pair<String, Tone> {
+    if (device.cdtPendingReboot) return "CDT 已写 · 待重启" to Tone.WARNING
+    val baseline = device.baseline
+    if (device.baselineSource != BaselineSource.PERSISTED || baseline == null) {
+        return "CDT 已写 · 效果未确认" to Tone.INFO
+    }
+    val deltas = device.current.zip(baseline).mapNotNull { (current, stock) ->
+        val live = current.millivolts ?: return@mapNotNull null
+        val original = stock.millivolts ?: return@mapNotNull null
+        live - original
+    }
+    return when {
+        deltas.any { it < 0 } && deltas.none { it > 0 } -> "CDT 已写 · 计划电压下降" to Tone.POSITIVE
+        deltas.any { it != 0 } -> "CDT 已写 · 计划电压有变化" to Tone.INFO
+        else -> "CDT 已写 · 计划电压无变化" to Tone.WARNING
+    }
+}
+
 @Composable
 private fun CdtActions(
     device: DevicePlan?,
@@ -253,7 +280,9 @@ private fun CdtActions(
                 if (cdtState == null) {
                     if (!busy || cdtUncertain) StatusPill("CDT 状态待确认", Tone.WARNING)
                 } else {
-                    val (label, tone) = planStateTag(cdtState)
+                    val (label, tone) = if (device?.sm8850 == true && cdtState == PlanState.CDT_WRITTEN) {
+                        sm8850CdtState(device)
+                    } else planStateTag(cdtState)
                     StatusPill(label, tone)
                 }
             }
@@ -265,7 +294,7 @@ private fun CdtActions(
             ) PlanState.EXTERNAL_RUNTIME else cdtState
             when (actionState) {
                 PlanState.STOCK_UNMODIFIED -> {
-                    if (device?.state == PlanState.STOCK_UNMODIFIED) {
+                    if (device?.state == PlanState.STOCK_UNMODIFIED && device.cdtFlashSupported) {
                         Button(onClick = onAskEnable, enabled = !busy) { Text("开启降压") }
                     }
                 }
@@ -299,7 +328,8 @@ private fun VoltageScreenPreview() {
     TunerTheme {
         VoltageScreen(
             state = ScreenState(),
-            onRefresh = {}, onCheckCompatibility = {}, onBackupCdt = {}, onEnableCdt = {}, onRestoreCdt = {}, onRebootNow = {},
+            onRefresh = {}, onCheckCompatibility = {}, onBackupCdt = {}, onEnableCdt = {}, onRestoreCdt = {},
+            onRestoreCdtFromFile = {}, onRebootNow = {},
             onManualSlt = {},
         )
     }

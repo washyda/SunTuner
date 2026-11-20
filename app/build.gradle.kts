@@ -14,8 +14,8 @@ android {
         applicationId = "io.washy.sm8750.tuner"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("7").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.3beta").get()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("8").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.4beta").get()
     }
 
     buildTypes {
@@ -52,6 +52,8 @@ val backendModules = listOf(
     "kernel/sm8750_scmi_plan_ro.ko",
     "kernel/sm8750_pvc_corr_ro.ko",
     "kernel/sm8750_stress_qos.ko",
+    "kernel/sm8850_stress_qos.ko",
+    "kernel/sm8850_scmi_plan_ro.ko",
 ).map(rootProject::file)
 val generateBackend by tasks.registering(Sync::class) {
     from(backendModules)
@@ -87,6 +89,7 @@ val buildLoadWorker = registerNativeBinary(
     listOf("src/main/cpp/openblas/sgemm_kernel_16x4.S"),
 )
 val buildCdtTool = registerNativeBinary("buildCdtTool", "src/main/cpp/cdt_tool.c", "cdt_tool")
+val buildCrashLogFilter = registerNativeBinary("buildCrashLogFilter", "src/main/cpp/crash_log_filter.c", "crash_log_filter")
 android.sourceSets["main"].assets.directories.addAll(listOf(generatedAssets.get().asFile.path, generatedNativeAssets.get().asFile.path))
 val gameNativeLibs = layout.buildDirectory.dir("generated/game-native-libs")
 val buildGameGpuClock by tasks.registering(Exec::class) {
@@ -107,7 +110,7 @@ val buildGameGpuClock by tasks.registering(Exec::class) {
     }
 }
 android.sourceSets["main"].jniLibs.directories.add(gameNativeLibs.get().asFile.path)
-tasks.named("preBuild") { dependsOn(generateBackend, buildLoadWorker, buildCdtTool, buildGameGpuClock) }
+tasks.named("preBuild") { dependsOn(generateBackend, buildLoadWorker, buildCdtTool, buildCrashLogFilter, buildGameGpuClock) }
 
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2026.03.00"))

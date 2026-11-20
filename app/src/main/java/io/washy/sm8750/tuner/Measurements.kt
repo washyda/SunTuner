@@ -3,10 +3,15 @@ package io.washy.sm8750.tuner
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-internal data class Level(val domain: Int, val index: Int, val khz: Int, val microwatts: Int) {
+internal data class Level(
+    val domain: Int,
+    val index: Int,
+    val khz: Int,
+    val microwatts: Int,
+    val coefficient: Long,
+) {
     val millivolts: Int?
         get() {
-            val coefficient = if (domain == 0) 100L else 136L
             val denominator = coefficient * khz
             val mV = (sqrt(microwatts * 1e9 / denominator) / 4).roundToInt() * 4
             return mV.takeIf { denominator * it * it / 1_000_000_000 == microwatts.toLong() }
@@ -43,7 +48,38 @@ internal data class DevicePlan(
     val current: List<Level>,
     val manualSltSupported: Boolean = false,
     val manualSltDomains: Set<Int> = emptySet(),
+    val sm8850: Boolean = false,
+    val cdtFlashSupported: Boolean = true,
+    val cdtPendingReboot: Boolean = false,
 )
+
+internal data class BenchmarkDevice(
+    val bootId: String,
+    val online: Set<Int>,
+    val frequencies: Map<Int, List<Int>>,
+    val fixedSupported: Boolean,
+    val voltagePlanSupported: Boolean = false,
+)
+
+internal fun parseBenchmarkDevice(output: String): BenchmarkDevice {
+    val lines = output.lineSequence().map(String::trim).toList()
+    fun value(tag: String) = lines.single { it.startsWith("$tag ") }.removePrefix("$tag ")
+    val online = value("ONLINE").split(',').flatMap {
+        it.substringBefore('-').toInt()..it.substringAfter('-', it).toInt()
+    }.toSet()
+    val frequencies = listOf(0, 6).mapIndexed { domain, policy ->
+        val points = value("POLICY $policy").split(Regex("\\s+")).map(String::toInt)
+        require(points.isNotEmpty() && points.all { it > 0 }) {
+            "policy$policy 的系统频点表无效"
+        }
+        domain to points.distinct().sorted()
+    }.toMap()
+    val bootId = value("BOOT")
+    require(bootId.isNotBlank() && online.isNotEmpty() && online.all { it in 0..7 }) { "CPU 拓扑读回不完整" }
+    return BenchmarkDevice(bootId, online, frequencies, value("FIXED") == "1", value("VOLTAGE") == "1")
+}
+
+internal fun List<Level>.frequenciesByDomain(): Map<Int, List<Int>> = groupBy(Level::domain, Level::khz)
 
 internal enum class FrequencyMode(val argument: String, val label: String) {
     MAX("max", "性能模式"),
@@ -130,6 +166,7 @@ internal enum class VoltageSourceKind(val label: String) {
     PVC_MEASURED("PMIC PVC 实测"),
     MIXED("PVC + SCMI"),
     SCMI_MODEL("SCMI 计划"),
+    UNAVAILABLE("未读取"),
 }
 
 internal data class LoadStats(
@@ -154,19 +191,16 @@ internal data class CoreStressDetail(
     val intActiveMhz: Double?,
     val fpActiveMhz: Double?,
     val clockStretched: Boolean,
-    val rmsVoltageMv: Double,
-    val voltageSource: VoltageSourceKind,
 )
 
 internal data class ClusterStressSummary(
     val domain: Int,
-    val rmsVoltageMv: Double,
+    val rmsVoltageMv: Double?,
     val nominalWeightedMhz: Double,
     val meanActiveMhz: Double?,
     val minLimitMhz: Double,
     val maxLimitMhz: Double,
-    val voltageSource: VoltageSourceKind,
-    val pvcCoverage: Double,
+    val pvcShare: Double,
 )
 
 internal data class StressSummary(
@@ -189,40 +223,19 @@ internal data class LoadRun(
     fun summarizeStress(): StressSummary = computeStressSummary(plan, stats)
 }
 
-private fun voltageSourceForCoverage(cov: Double): VoltageSourceKind = when {
+private fun voltageSourceForCoverage(cov: Double, hasPlan: Boolean): VoltageSourceKind = when {
     cov >= 0.80 -> VoltageSourceKind.PVC_MEASURED
     cov > 0.0 -> VoltageSourceKind.MIXED
-    else -> VoltageSourceKind.SCMI_MODEL
+    hasPlan -> VoltageSourceKind.SCMI_MODEL
+    else -> VoltageSourceKind.UNAVAILABLE
 }
 
 private fun computeStressSummary(plan: List<Level>, stats: LoadStats): StressSummary {
     val levelsByDomain = plan.groupBy { it.domain }.mapValues { (_, list) -> list.associateBy { it.khz } }
     val pvcByDomain = stats.pvcSamples.groupBy { it.domain }.mapValues { (_, list) -> list.associateBy { it.khz } }
 
-    data class CoreEval(val detail: CoreStressDetail, val pvcShare: Double)
-
-    val evals = stats.cores.map { core ->
-        val domain = domainFor(core.core)
-        val policy = stats.policies.getValue(domain)
-        val totalTicks = policy.residency.values.sum().toDouble().coerceAtLeast(1.0)
-        val levelMap = levelsByDomain[domain].orEmpty()
-        val pvcMap = pvcByDomain[domain].orEmpty()
-
-        var weightedNomMhz = 0.0
-        var weightedV2 = 0.0
-        var pvcShare = 0.0
-
-        for ((khz, ticks) in policy.residency) {
-            if (ticks <= 0) continue
-            val share = ticks / totalTicks
-            val scmiMv = (levelMap[khz]?.millivolts ?: 0).toDouble()
-            val pvcMv = pvcMap[khz]?.takeIf { it.count >= 2 }?.medianMv?.toDouble()
-            val mv = pvcMv ?: scmiMv
-            if (pvcMv != null) pvcShare += share
-            weightedNomMhz += share * (khz / 1000.0)
-            weightedV2 += share * mv * mv
-        }
-
+    val details = stats.cores.map { core ->
+        val weightedNomMhz = stats.policies.getValue(domainFor(core.core)).weightedAvgMhz
         val busyRatio = (core.busyNs.toDouble() / stats.elapsedNs).coerceIn(0.0, 1.0)
         val activeMhz = core.activeMhz
         val stretchRatio = if (activeMhz != null && weightedNomMhz > 0.0) {
@@ -232,55 +245,59 @@ private fun computeStressSummary(plan: List<Level>, stats: LoadStats): StressSum
         val mopsPerSec = core.iterations * 1000.0 / stats.elapsedNs
         val intGiops = if (stats.intWallNs > 0L && core.intOps > 0L) core.intOps / stats.intWallNs.toDouble() else null
         val fpGflops = if (stats.fpWallNs > 0L && core.fpOps > 0L) core.fpOps / stats.fpWallNs.toDouble() else null
-        CoreEval(
-            detail = CoreStressDetail(
-                core = core.core,
-                threads = core.threads,
-                busyPercent = 100.0 * busyRatio,
-                mopsPerSec = mopsPerSec,
-                intGiops = intGiops,
-                fpGflops = fpGflops,
-                nominalWeightedMhz = weightedNomMhz,
-                activeMhz = activeMhz,
-                intActiveMhz = core.intActiveMhz,
-                fpActiveMhz = core.fpActiveMhz,
-                clockStretched = stretched,
-                rmsVoltageMv = sqrt(weightedV2),
-                voltageSource = voltageSourceForCoverage(pvcShare),
-            ),
-            pvcShare = pvcShare,
+        CoreStressDetail(
+            core = core.core,
+            threads = core.threads,
+            busyPercent = 100.0 * busyRatio,
+            mopsPerSec = mopsPerSec,
+            intGiops = intGiops,
+            fpGflops = fpGflops,
+            nominalWeightedMhz = weightedNomMhz,
+            activeMhz = activeMhz,
+            intActiveMhz = core.intActiveMhz,
+            fpActiveMhz = core.fpActiveMhz,
+            clockStretched = stretched,
         )
     }
 
-    val details = evals.map { it.detail }
-    val clusters = evals.groupBy { domainFor(it.detail.core) }.mapValues { (domain, list) ->
-        val items = list.map { it.detail }
-        val cov = list.map { it.pvcShare }.average()
+    val clusters = details.groupBy { domainFor(it.core) }.mapValues { (domain, items) ->
         val policy = stats.policies.getValue(domain)
+        val totalTicks = policy.residency.values.sum()
+        var pvcTicks = 0L
+        var coveredTicks = 0L
+        var weightedV2 = 0.0
+        for ((khz, ticks) in policy.residency) {
+            if (ticks <= 0) continue
+            val pvc = pvcByDomain[domain]?.get(khz)?.takeIf { it.count >= 2 }
+            val mv = pvc?.medianMv ?: levelsByDomain[domain]?.get(khz)?.millivolts ?: continue
+            if (pvc != null) pvcTicks += ticks
+            coveredTicks += ticks
+            weightedV2 += ticks.toDouble() * mv * mv
+        }
         val activeVals = items.mapNotNull { it.activeMhz }
         ClusterStressSummary(
             domain = domain,
-            rmsVoltageMv = items.first().rmsVoltageMv,
-            nominalWeightedMhz = items.first().nominalWeightedMhz,
+            rmsVoltageMv = if (totalTicks > 0 && coveredTicks == totalTicks) sqrt(weightedV2 / totalTicks) else null,
+            nominalWeightedMhz = policy.weightedAvgMhz,
             meanActiveMhz = activeVals.takeIf { it.isNotEmpty() }?.average(),
             minLimitMhz = policy.minLimit / 1000.0,
             maxLimitMhz = policy.maxLimit / 1000.0,
-            voltageSource = voltageSourceForCoverage(cov),
-            pvcCoverage = cov,
+            pvcShare = pvcTicks.toDouble() / totalTicks,
         )
     }
 
     val totalMops = details.sumOf { it.mopsPerSec }
     val totalIntGiops = if (details.any { it.intGiops != null }) details.sumOf { it.intGiops ?: 0.0 } else null
     val totalFpGflops = if (details.any { it.fpGflops != null }) details.sumOf { it.fpGflops ?: 0.0 } else null
-    val meanCov = evals.map { it.pvcShare }.average()
+    val measuredClusters = clusters.values.filter { it.rmsVoltageMv != null }
     return StressSummary(
         cores = details,
         clusters = clusters,
         totalMopsPerSec = totalMops,
         totalIntGiops = totalIntGiops,
         totalFpGflops = totalFpGflops,
-        overallSource = voltageSourceForCoverage(meanCov),
+        overallSource = if (measuredClusters.isEmpty()) VoltageSourceKind.UNAVAILABLE
+            else voltageSourceForCoverage(measuredClusters.map { it.pvcShare }.average(), plan.isNotEmpty()),
         anyClockStretch = details.any { it.clockStretched },
     )
 }
@@ -289,6 +306,7 @@ internal fun parsePlan(output: String): DevicePlan {
     val lines = output.lines()
     fun field(name: String) = lines.single { it.startsWith("$name ") }.substringAfter(' ')
     fun optionalField(name: String) = lines.singleOrNull { it.startsWith("$name ") }?.substringAfter(' ')
+    val sm8850 = optionalField("PLAN_MODEL") == "SM8850"
     fun rows(name: String): List<Level> {
         val start = lines.indexOf("BEGIN $name")
         require(start >= 0) { "SCMI 计划缺失" }
@@ -297,13 +315,21 @@ internal fun parsePlan(output: String): DevicePlan {
             .map {
                 val p = it.split(',').map(String::toInt)
                 require(p.size == 7 && p[1] == p[6] && p[3] > 0 && p[5] > 0)
-                Level(p[0], p[1], p[5], p[3])
+                val coefficient = when (p[0]) {
+                    0 -> 100L
+                    1 -> if (sm8850) 150L else 136L
+                    else -> error("未知 SCMI 性能域 ${p[0]}")
+                }
+                Level(p[0], p[1], p[5], p[3], coefficient)
             }
             .sortedWith(compareBy(Level::domain, Level::index))
-        require(levels.size == 32 && levels.groupBy { it.domain }.values.all { domain ->
-            domain.map { it.index } == (0..15).toList() &&
+        val domains = levels.groupBy(Level::domain)
+        require(domains.keys == setOf(0, 1) && domains.values.all { domain ->
+            (sm8850 || domain.size == 16) &&
+                domain.map(Level::index) == domain.indices.toList() &&
                 domain.zipWithNext().all { (a, b) -> a.khz < b.khz }
         }) { "SCMI 计划不完整" }
+        if (sm8850) require(levels.all { it.millivolts != null }) { "SM8850 SCMI 电压模型校验失败" }
         return levels
     }
 
@@ -339,17 +365,30 @@ internal fun parsePlan(output: String): DevicePlan {
         manualSltSupported = optionalField("SLT_SUPPORTED") == "1",
         manualSltDomains = optionalField("SLT_DOMAINS")?.split(',')
             .orEmpty().mapNotNull(String::toIntOrNull).toSet(),
+        sm8850 = sm8850,
+        cdtFlashSupported = !sm8850 || optionalField("CDT_FLASH_SUPPORTED") == "1",
+        cdtPendingReboot = optionalField("CDT_PENDING_REBOOT") == "1",
     )
 }
 
-internal fun parseLoadStats(output: String, config: LoadConfig, plan: List<Level>): LoadStats? {
+internal fun parseLoadStats(
+    output: String,
+    config: LoadConfig,
+    frequencies: Map<Int, List<Int>>,
+    allowExtraFrequencies: Boolean = false,
+): LoadStats? {
     val lines = output.lines()
     if ("STOPPED" in lines) return null
     require("DONE" in lines && "FINISH" in lines) { "烤机采样未完整结束" }
-    return parseLoadStatsLines(lines, config, plan)
+    return parseLoadStatsLines(lines, config, frequencies, allowExtraFrequencies)
 }
 
-private fun parseLoadStatsLines(lines: List<String>, config: LoadConfig, plan: List<Level>): LoadStats {
+private fun parseLoadStatsLines(
+    lines: List<String>,
+    config: LoadConfig,
+    frequencies: Map<Int, List<Int>>,
+    allowExtraFrequencies: Boolean,
+): LoadStats {
     val timeParts = lines.single { it.startsWith("TIME ") }.split(' ').drop(1).map(String::toLong)
     val elapsed = timeParts[0]
     val intWallNs = timeParts.getOrElse(1) { 0L }
@@ -398,11 +437,12 @@ private fun parseLoadStatsLines(lines: List<String>, config: LoadConfig, plan: L
 
     val profiles = residency.mapValues { (domain, entries) ->
         val dwell = entries.associate { it.second to it.third }
+        val expected = frequencies.getValue(domain).toSet()
+        val matching = if (allowExtraFrequencies) dwell.keys.containsAll(expected) else dwell.keys == expected
         require(
-            entries.size == 16 &&
-                dwell.keys == plan.filter { it.domain == domain }.map { it.khz }.toSet() &&
+            entries.size == dwell.size && matching &&
                 dwell.values.all { it >= 0 } && dwell.values.sum() > 0,
-        ) { "频率驻留不能与 SCMI 计划匹配" }
+        ) { "频率驻留与设备频点表不匹配" }
         val limit = limits.getValue(domain)
         PolicyLoad(limit[1], limit[2], limit[3], limit[4], limit[5], dwell)
     }

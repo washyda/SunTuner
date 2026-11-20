@@ -20,7 +20,7 @@
 enum {
     CORE_COUNT = 8,
     MAX_THREADS = 32,
-    POINTS = 16,
+    MAX_POINTS = 256,
     INT_LANES = 16,
     INT_BATCH = 2048,
     INT_OPS_PER_ITER = 16,
@@ -288,21 +288,23 @@ static void *load_core(void *arg) {
     return NULL;
 }
 
-static bool read_residency(unsigned policy, struct range values[POINTS]) {
+static unsigned read_residency(unsigned policy, struct range values[MAX_POINTS]) {
     char path[160];
     snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpufreq/policy%u/stats/time_in_state", policy);
     FILE *file = fopen(path, "r");
-    if (!file) return false;
+    if (!file) return 0;
+
     unsigned count = 0;
-    while (count < POINTS &&
-           fscanf(file, "%u %" SCNu64, &values[count].freq, &values[count].ticks) == 2) {
-        if (!values[count].freq) break;
-        ++count;
+    unsigned freq;
+    uint64_t ticks;
+    int fields;
+    while ((fields = fscanf(file, "%u %" SCNu64, &freq, &ticks)) == 2) {
+        if (!freq || count == MAX_POINTS) break;
+        values[count++] = (struct range){freq, ticks};
     }
-    unsigned extra_freq;
-    bool valid = count == POINTS && fscanf(file, "%u", &extra_freq) == EOF && !ferror(file);
+    bool valid = fields == EOF && !ferror(file);
     fclose(file);
-    return valid;
+    return valid ? count : 0;
 }
 
 static long read_arg(const char *text) {
@@ -399,13 +401,15 @@ int main(int argc, char *argv[]) {
         }
     }
     bool use_policy[] = {(mask & 0x3f) != 0, (mask & 0xc0) != 0};
-    struct range before[2][POINTS], after[2][POINTS];
+    struct range before[2][MAX_POINTS], after[2][MAX_POINTS];
+    unsigned point_count[2] = {0};
     struct policy_sample samples[2] = {0};
     for (unsigned i = 0; valid && i < 2; ++i) {
         if (!use_policy[i]) continue;
         samples[i].nominal_max = read_policy(policies[i], "cpuinfo_max_freq");
         sample_policy(policies[i], &samples[i]);
-        if (!read_residency(policies[i], before[i]) || !samples[i].nominal_max || !samples[i].highest_limit) {
+        point_count[i] = read_residency(policies[i], before[i]);
+        if (!point_count[i] || !samples[i].nominal_max || !samples[i].highest_limit) {
             fprintf(stderr, "ERROR policy%u 频率驻留表不可用\n", policies[i]);
             valid = false;
         }
@@ -474,7 +478,7 @@ int main(int argc, char *argv[]) {
     }
     uint64_t elapsed = end_wall - begin;
     for (unsigned i = 0; valid && !canceled && i < 2; ++i) {
-        if (use_policy[i] && !read_residency(policies[i], after[i])) {
+        if (use_policy[i] && read_residency(policies[i], after[i]) != point_count[i]) {
             fprintf(stderr, "ERROR policy%u 频率驻留复读失败\n", policies[i]);
             valid = false;
         }
@@ -496,7 +500,7 @@ int main(int argc, char *argv[]) {
 
     for (unsigned i = 0; i < 2; ++i) {
         if (!use_policy[i]) continue;
-        for (unsigned j = 0; j < POINTS; ++j) {
+        for (unsigned j = 0; j < point_count[i]; ++j) {
             if (after[i][j].freq != before[i][j].freq || after[i][j].ticks < before[i][j].ticks) {
                 fprintf(stderr, "ERROR policy%u 烤机期间频率计数被重置\n", policies[i]);
                 return 1;
@@ -543,7 +547,7 @@ int main(int argc, char *argv[]) {
             fprintf(out, "LIMIT %u %u %u %u %u %u\n", policies[i], samples[i].nominal_max,
                     samples[i].lowest_limit, samples[i].highest_limit,
                     samples[i].lowest_floor, samples[i].highest_floor);
-            for (unsigned j = 0; j < POINTS; ++j) {
+            for (unsigned j = 0; j < point_count[i]; ++j) {
                 fprintf(out, "FREQ %u %u %" PRIu64 "\n", policies[i], after[i][j].freq,
                         after[i][j].ticks - before[i][j].ticks);
             }

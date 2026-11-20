@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * SM8750 native PERF query client: draft, never loaded on the phone.
+ * Native SCMI PERF query client for SunTuner.
  * Requires the compatible kernel's drivers/firmware/arm_scmi/protocols.h.
  * Each snapshot read sends only VERSION, ATTRIBUTES and DESCRIBE_LEVELS.
  * Outputs estimated power and frequency, not a physical voltage reading.
@@ -15,7 +15,11 @@
 #include "protocols.h"
 
 #define PLAN_DOMAINS 2U
+#ifdef SUNTUNER_SM8850
+#define PLAN_STATES 128U
+#else
 #define PLAN_STATES 16U
+#endif
 #define PLAN_RECORD_SIZE 20U
 #define PLAN_DESCRIBE_LEVELS 0x04
 
@@ -52,20 +56,17 @@ out:
 static int plan_domain(const struct scmi_protocol_handle *ph, u32 domain,
 		       char *buf, size_t *written)
 {
-	u32 index;
+	u32 index = 0;
+	u16 remaining;
 	int ret;
 
-	/* Static analysis of this image: one record returned per request. */
-	for (index = 0; index < PLAN_STATES; index++) {
+	do {
 		struct scmi_xfer *t;
 		const u8 *record;
-		u16 returned, remaining;
-		u32 perf, power, freq, level_index;
-		u16 latency;
+		u16 returned, row;
 
 		/* A zero receive size asks the core for its transport maximum. */
-		ret = ph->xops->xfer_get_init(ph, PLAN_DESCRIBE_LEVELS,
-					      8, 0, &t);
+		ret = ph->xops->xfer_get_init(ph, PLAN_DESCRIBE_LEVELS, 8, 0, &t);
 		if (ret)
 			return ret;
 		put_unaligned_le32(domain, t->tx.buf);
@@ -79,33 +80,40 @@ static int plan_domain(const struct scmi_protocol_handle *ph, u32 domain,
 		}
 		returned = get_unaligned_le16(t->rx.buf);
 		remaining = get_unaligned_le16((u8 *)t->rx.buf + 2);
+#ifdef SUNTUNER_SM8850
+		if (!returned || returned > (t->rx.len - 4) / PLAN_RECORD_SIZE ||
+		    index + returned + remaining > PLAN_STATES) {
+#else
 		if (returned != 1 || remaining != PLAN_STATES - index - 1) {
+#endif
 			ret = -EPROTO;
 			goto release;
 		}
 		record = (u8 *)t->rx.buf + 4;
-		perf = get_unaligned_le32(record);
-		power = get_unaligned_le32(record + 4);
-		latency = get_unaligned_le16(record + 8);
-		freq = get_unaligned_le32(record + 12);
-		level_index = get_unaligned_le32(record + 16);
-		/* Ignore the v4 reserved halfword, as the native PERF reader does. */
-		if (!freq || !power) {
-			ret = -EPROTO;
-			goto release;
+		for (row = 0; row < returned; row++, index++, record += PLAN_RECORD_SIZE) {
+			u32 perf = get_unaligned_le32(record);
+			u32 power = get_unaligned_le32(record + 4);
+			u16 latency = get_unaligned_le16(record + 8);
+			u32 freq = get_unaligned_le32(record + 12);
+			u32 level_index = get_unaligned_le32(record + 16);
+
+			if (!freq || !power) {
+				ret = -EPROTO;
+				goto release;
+			}
+			if (PAGE_SIZE - *written < 128) {
+				ret = -EOVERFLOW;
+				goto release;
+			}
+			*written += sysfs_emit_at(buf, *written,
+				"%u,%u,%u,%u,%u,%u,%u\n", domain, index, perf,
+				power, latency, freq, level_index);
 		}
-		if (PAGE_SIZE - *written < 128) {
-			ret = -EOVERFLOW;
-			goto release;
-		}
-		*written += sysfs_emit_at(buf, *written,
-			"%u,%u,%u,%u,%u,%u,%u\n", domain, index, perf,
-			power, latency, freq, level_index);
 release:
 		ph->xops->xfer_put(ph, t);
 		if (ret)
 			return ret;
-	}
+	} while (remaining);
 	return 0;
 }
 

@@ -50,6 +50,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.washy.sm8750.tuner.ui.BenchmarkScreen
 import io.washy.sm8750.tuner.ui.CompatibilityScreen
+import io.washy.sm8750.tuner.ui.CrashLogScreen
 import io.washy.sm8750.tuner.ui.GameScenarioScreen
 import io.washy.sm8750.tuner.ui.TunerTheme
 import io.washy.sm8750.tuner.ui.TunerThemeTokens
@@ -72,6 +73,9 @@ class MainActivity : ComponentActivity() {
             val cdtBackupPicker = rememberLauncherForActivityResult(
                 ActivityResultContracts.CreateDocument("application/octet-stream"),
             ) { uri -> uri?.let(model::backupCdt) }
+            val cdtRestorePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                uri?.let { model.restoreCdt(source = it) }
+            }
             LaunchedEffect(state.operation) {
                 if (state.operation?.isLoad == true ||
                     state.operation == Operation.WRITING_CDT || state.operation == Operation.MANUAL_SLT
@@ -104,6 +108,7 @@ class MainActivity : ComponentActivity() {
                     onEnableCdt = model::enableCdt,
                     onManualSlt = model::startManualSlt,
                     onRestoreCdt = { model.restoreCdt(fallbackClean = false) },
+                    onRestoreCdtFromFile = { cdtRestorePicker.launch(arrayOf("*/*")) },
                     onRestoreFallbackClean = { model.restoreCdt(fallbackClean = true) },
                     onDismissRestoreNoBackup = model::dismissRestoreNoBackup,
                     onRebootNow = model::rebootNow,
@@ -120,6 +125,11 @@ class MainActivity : ComponentActivity() {
                     onStartGame = model::startGameTest,
                     onStopGame = model::stopGameTest,
                     onStop = model::stopLoad,
+                    crashLogContent = {
+                        val logs by model.crashLogState.collectAsStateWithLifecycle()
+                        LaunchedEffect(Unit) { model.refreshCrashLogs() }
+                        CrashLogScreen(logs, model::refreshCrashLogs, model::deleteCrashLogs, model::exportCrashLog)
+                    },
                 )
             }
         }
@@ -147,6 +157,7 @@ private fun TunerApp(
     onEnableCdt: () -> Unit,
     onManualSlt: (Int) -> Unit,
     onRestoreCdt: () -> Unit,
+    onRestoreCdtFromFile: () -> Unit,
     onRestoreFallbackClean: () -> Unit,
     onDismissRestoreNoBackup: () -> Unit,
     onRebootNow: () -> Unit,
@@ -163,6 +174,7 @@ private fun TunerApp(
     onStartGame: () -> Unit,
     onStopGame: () -> Unit,
     onStop: () -> Unit,
+    crashLogContent: @Composable () -> Unit = {},
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
 
@@ -210,7 +222,7 @@ private fun TunerApp(
     state.rebootPrompt?.let { prompt ->
         val title = if (prompt == RebootPrompt.ENABLED_CDT) "CDT 写入成功" else "CDT 还原成功"
         val body = if (prompt == RebootPrompt.ENABLED_CDT) {
-            "分区校验通过，需要重启生效。"
+            "分区校验通过。重启后可检查电压计划是否变化。"
         } else {
             "分区已还原并校验，需要重启恢复原厂电压。"
         }
@@ -235,8 +247,9 @@ private fun TunerApp(
 
     Scaffold(
         topBar = {
-            if (tab == 1) {
-                TopAppBar(title = { Text(stringResource(R.string.app_name)) })
+            when (tab) {
+                1 -> TopAppBar(title = { Text(stringResource(R.string.app_name)) })
+                2 -> TopAppBar(title = { Text("崩溃日志") })
             }
         },
         bottomBar = {
@@ -253,9 +266,19 @@ private fun TunerApp(
                     icon = { BenchmarkNavIcon() },
                     label = { Text("烤机") },
                 )
+                NavigationBarItem(
+                    selected = tab == 2,
+                    onClick = { tab = 2 },
+                    icon = { CrashLogNavIcon() },
+                    label = { Text("日志") },
+                )
             }
         },
     ) { padding ->
+        if (tab == 2) {
+            Box(Modifier.fillMaxSize().padding(padding)) { crashLogContent() }
+            return@Scaffold
+        }
         Column(Modifier.fillMaxSize().padding(padding)) {
             if (state.operation != null && !state.operation.isLoad) {
                 LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -306,6 +329,7 @@ private fun TunerApp(
                         onEnableCdt = onEnableCdt,
                         onManualSlt = onManualSlt,
                         onRestoreCdt = onRestoreCdt,
+                        onRestoreCdtFromFile = onRestoreCdtFromFile,
                         onRebootNow = onRebootNow,
                     )
                 } else {
@@ -379,6 +403,25 @@ private fun BenchmarkNavIcon() {
     }
 }
 
+@Composable
+private fun CrashLogNavIcon() {
+    val tint = LocalContentColor.current
+    Canvas(Modifier.size(22.dp)) {
+        val w = size.width
+        val h = size.height
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(w * 0.22f, h * 0.12f),
+            size = Size(w * 0.56f, h * 0.76f),
+            cornerRadius = CornerRadius(w * 0.08f),
+            style = Stroke(width = w * 0.08f),
+        )
+        for (row in listOf(0.36f, 0.50f, 0.64f)) {
+            drawLine(tint, Offset(w * 0.37f, h * row), Offset(w * 0.63f, h * row), w * 0.07f, StrokeCap.Round)
+        }
+    }
+}
+
 @Preview(showBackground = true)
 @Composable
 private fun TunerPreview() {
@@ -388,7 +431,7 @@ private fun TunerPreview() {
             onRefresh = {}, onCheckCompatibility = {}, onExportDiagnostics = {}, onDismissDiagnosticsResult = {},
             onExportCdtFailureLog = {}, onDismissCdtLogExportResult = {},
             onBackupCdt = {}, onDismissCdtBackupResult = {},
-            onEnableCdt = {}, onRestoreCdt = {}, onRestoreFallbackClean = {},
+            onEnableCdt = {}, onRestoreCdt = {}, onRestoreCdtFromFile = {}, onRestoreFallbackClean = {},
             onManualSlt = {},
             onDismissRestoreNoBackup = {}, onRebootNow = {}, onDismissReboot = {},
             onPreset = {}, onCore = {}, onThreads = {}, onSeconds = {}, onQuickSeconds = {},

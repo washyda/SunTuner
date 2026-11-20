@@ -104,6 +104,20 @@ internal class RootBackend(private val context: Context) {
 
     suspend fun read(): DevicePlan = parsePlan(command(listOf("read")))
 
+    suspend fun readBenchmarkDevice(): BenchmarkDevice =
+        parseBenchmarkDevice(command(listOf("read_frequencies")))
+
+    suspend fun readCrashLogs(): String = command(listOf("crash_logs"))
+
+    suspend fun deleteCrashEvidence(args: List<String>) {
+        command(listOf("crash_logs") + args)
+    }
+
+    suspend fun exportCrashLog(destination: Uri, entry: CrashEntry) = withContext(Dispatchers.IO) {
+        val output = context.contentResolver.openOutputStream(destination, "wt") ?: error("无法打开保存位置")
+        output.use { it.write(entry.reportText().encodeToByteArray()) }
+    }
+
     suspend fun runManualSlt(bootId: String, domain: Int): ManualSltResult {
         require(domain in 0..1)
         val output = command(listOf("manual_slt", bootId, domain.toString()))
@@ -124,6 +138,19 @@ internal class RootBackend(private val context: Context) {
     }
 
     suspend fun collectDiagnostics(): CompatibilityReport = withContext(Dispatchers.IO) {
+        val installedPackage = context.packageManager.getPackageInfo(context.packageName, 0)
+        val apkSha256 = runCatching {
+            val digest = MessageDigest.getInstance("SHA-256")
+            File(context.applicationInfo.sourceDir).inputStream().use { input ->
+                val buffer = ByteArray(8192)
+                var size = input.read(buffer)
+                while (size != -1) {
+                    digest.update(buffer, 0, size)
+                    size = input.read(buffer)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }.getOrDefault("unavailable")
         val rootReport = try {
             command(listOf("diagnostics"))
         } catch (e: CancellationException) {
@@ -133,6 +160,9 @@ internal class RootBackend(private val context: Context) {
         }
         val report = buildString {
             appendLine("SunTuner compatibility report v1")
+            appendLine("APP_VERSION=${installedPackage.versionName}")
+            appendLine("APP_VERSION_CODE=${installedPackage.longVersionCode}")
+            appendLine("APK_SHA256=$apkSha256")
             appendLine("MODEL=${Build.MODEL}")
             appendLine("MANUFACTURER=${Build.MANUFACTURER}")
             appendLine("DEVICE=${Build.DEVICE}")
@@ -167,10 +197,35 @@ internal class RootBackend(private val context: Context) {
     suspend fun enableCdt(bootId: String): CdtOperationResult =
         cdtCommand(listOf("cdt_enable", bootId))
 
-    suspend fun restoreCdt(bootId: String, fallbackClean: Boolean = false): CdtOperationResult {
-        val args = listOf("cdt_restore", bootId) + if (fallbackClean) listOf("--fallback-clean") else emptyList()
-        return cdtCommand(args)
-    }
+    suspend fun restoreCdt(bootId: String, fallbackClean: Boolean, source: Uri?): CdtOperationResult =
+        withContext(Dispatchers.IO) {
+            val args = listOf("cdt_restore", bootId)
+            if (source == null) {
+                return@withContext cdtCommand(if (fallbackClean) args + "--fallback-clean" else args)
+            }
+
+            val staged = File.createTempFile("cdt-restore-", ".img", context.cacheDir)
+            try {
+                val sourceStream = context.contentResolver.openInputStream(source)
+                    ?: error("无法打开所选 CDT 镜像")
+                sourceStream.use { input ->
+                    staged.outputStream().use { output ->
+                        val buffer = ByteArray(8192)
+                        var total = 0
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count == -1) break
+                            total += count
+                            check(total <= 1_048_576) { "所选文件超出 CDT 镜像大小上限" }
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                }
+                cdtCommand(args + listOf("--from-file", staged.path))
+            } finally {
+                staged.delete()
+            }
+        }
 
     suspend fun readCdtPartition(): CdtPartition =
         parsePartition(traceCommand(listOf("cdt_status"), StringBuilder()))
@@ -335,9 +390,10 @@ internal class RootBackend(private val context: Context) {
     }
 
     suspend fun runLoad(
-        device: DevicePlan,
+        device: BenchmarkDevice,
         config: LoadConfig,
         control: LoadControl,
+        allowExtraFrequencies: Boolean,
         onLine: (String) -> Unit,
     ): LoadStats? {
         val args = listOf(
@@ -345,7 +401,7 @@ internal class RootBackend(private val context: Context) {
             config.mode.argument, (config.targets[0] ?: 0).toString(), (config.targets[1] ?: 0).toString(),
             config.workload.argument,
         )
-        return parseLoadStats(command(args, control, onLine), config, device.current)
+        return parseLoadStats(command(args, control, onLine), config, device.frequencies, allowExtraFrequencies)
     }
 
     private suspend fun command(

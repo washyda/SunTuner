@@ -29,11 +29,11 @@ internal fun RunKpiGrid(
     val voltageTone = when (summary.overallSource) {
         VoltageSourceKind.PVC_MEASURED -> Tone.POSITIVE
         VoltageSourceKind.MIXED -> Tone.INFO
-        VoltageSourceKind.SCMI_MODEL -> Tone.NEUTRAL
+        VoltageSourceKind.SCMI_MODEL, VoltageSourceKind.UNAVAILABLE -> Tone.NEUTRAL
     }
-    val rmsSummary = summary.clusters.toSortedMap().entries.joinToString(" · ") { (d, c) ->
-        "P$d ${decimal(c.rmsVoltageMv, 0)}mV"
-    }
+    val rmsSummary = summary.clusters.toSortedMap().mapNotNull { (domain, cluster) ->
+        cluster.rmsVoltageMv?.let { "P$domain ${decimal(it, 0)}mV" }
+    }.joinToString(" · ")
     val avgFreqText = summary.clusters.toSortedMap().entries.joinToString(" · ") { (d, c) ->
         "P$d ${c.meanActiveMhz?.let { decimal(it, 0) } ?: "—"}"
     }
