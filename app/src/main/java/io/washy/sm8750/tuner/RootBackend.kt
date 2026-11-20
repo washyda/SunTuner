@@ -104,6 +104,25 @@ internal class RootBackend(private val context: Context) {
 
     suspend fun read(): DevicePlan = parsePlan(command(listOf("read")))
 
+    suspend fun runManualSlt(bootId: String, domain: Int): ManualSltResult {
+        require(domain in 0..1)
+        val output = command(listOf("manual_slt", bootId, domain.toString()))
+        val changed = output.lineSequence().singleOrNull { it.startsWith("SLT_CHANGED ") }
+            ?.substringAfter(' ')?.toIntOrNull()
+        val plan = parsePlan(output)
+        check(changed != null && changed in 0..16 && plan.bootId == bootId && domain in plan.manualSltDomains) {
+            "手动 SLT 读回不完整，请刷新电压计划"
+        }
+        return ManualSltResult(plan, changed)
+    }
+
+    fun startGameTrace(tids: Set<Int>): GameTrace = GameTrace(tids) {
+        val args = listOf("/system/bin/sh", File(bundle, "game_trace.sh").path) + tids.map(Int::toString)
+        ProcessBuilder("su", "-c", args.joinToString(" ") { shellQuote(it) })
+            .redirectErrorStream(true)
+            .start()
+    }
+
     suspend fun collectDiagnostics(): CompatibilityReport = withContext(Dispatchers.IO) {
         val rootReport = try {
             command(listOf("diagnostics"))
@@ -380,3 +399,5 @@ internal data class CdtBackupResult(
     val displayName: String?,
     val sha256: String,
 )
+
+internal data class ManualSltResult(val plan: DevicePlan, val changed: Int)

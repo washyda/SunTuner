@@ -57,6 +57,7 @@ internal fun BenchmarkScreen(
     onWorkload: (WorkloadKind) -> Unit,
     onFrequency: (Int, Int) -> Unit,
     onStart: () -> Unit,
+    onStartGame: () -> Unit,
     onStop: () -> Unit,
 ) {
     val running = state.operation == Operation.LOADING
@@ -68,6 +69,9 @@ internal fun BenchmarkScreen(
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        item(key = "stability_test") {
+            GameScenarioCard(state.gameResult, state.operation == null, onStartGame)
+        }
         item {
             Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {

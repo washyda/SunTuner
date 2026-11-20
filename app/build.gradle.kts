@@ -14,8 +14,8 @@ android {
         applicationId = "io.washy.sm8750.tuner"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("4").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.0beta").get()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("7").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.3beta").get()
     }
 
     buildTypes {
@@ -48,6 +48,7 @@ val ndk = providers.environmentVariable("ANDROID_NDK_HOME").orElse(
 val generatedAssets = layout.buildDirectory.dir("generated/tuner-assets")
 val backendModules = listOf(
     "kernel/sm8750_acd_observer.ko",
+    "kernel/sm8750_apns_trigger.ko",
     "kernel/sm8750_scmi_plan_ro.ko",
     "kernel/sm8750_pvc_corr_ro.ko",
     "kernel/sm8750_stress_qos.ko",
@@ -87,7 +88,26 @@ val buildLoadWorker = registerNativeBinary(
 )
 val buildCdtTool = registerNativeBinary("buildCdtTool", "src/main/cpp/cdt_tool.c", "cdt_tool")
 android.sourceSets["main"].assets.directories.addAll(listOf(generatedAssets.get().asFile.path, generatedNativeAssets.get().asFile.path))
-tasks.named("preBuild") { dependsOn(generateBackend, buildLoadWorker, buildCdtTool) }
+val gameNativeLibs = layout.buildDirectory.dir("generated/game-native-libs")
+val buildGameGpuClock by tasks.registering(Exec::class) {
+    val source = file("src/main/cpp/game_gpu_clock.c")
+    val library = gameNativeLibs.map { it.file("arm64-v8a/libgame_gpu_clock.so") }
+    inputs.file(source)
+    inputs.property("ndkPath", ndk)
+    outputs.file(library)
+    doFirst {
+        val toolchain = file("${ndk.get()}/toolchains/llvm/prebuilt").listFiles()!!.single { it.isDirectory }
+        val clang = toolchain.resolve("bin/clang" + if (System.getProperty("os.name").startsWith("Windows")) ".exe" else "")
+        library.get().asFile.parentFile.mkdirs()
+        commandLine(
+            clang.absolutePath, "--target=aarch64-linux-android30", "-std=c17", "-O2",
+            "-shared", "-fPIC", "-Wall", "-Wextra", "-Werror", "-Wl,-z,max-page-size=16384",
+            source.absolutePath, "-lEGL", "-lGLESv3", "-o", library.get().asFile.absolutePath,
+        )
+    }
+}
+android.sourceSets["main"].jniLibs.directories.add(gameNativeLibs.get().asFile.path)
+tasks.named("preBuild") { dependsOn(generateBackend, buildLoadWorker, buildCdtTool, buildGameGpuClock) }
 
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2026.03.00"))

@@ -41,6 +41,8 @@ internal data class DevicePlan(
     val online: Set<Int>,
     val baseline: List<Level>?,
     val current: List<Level>,
+    val manualSltSupported: Boolean = false,
+    val manualSltDomains: Set<Int> = emptySet(),
 )
 
 internal enum class FrequencyMode(val argument: String, val label: String) {
@@ -286,6 +288,7 @@ private fun computeStressSummary(plan: List<Level>, stats: LoadStats): StressSum
 internal fun parsePlan(output: String): DevicePlan {
     val lines = output.lines()
     fun field(name: String) = lines.single { it.startsWith("$name ") }.substringAfter(' ')
+    fun optionalField(name: String) = lines.singleOrNull { it.startsWith("$name ") }?.substringAfter(' ')
     fun rows(name: String): List<Level> {
         val start = lines.indexOf("BEGIN $name")
         require(start >= 0) { "SCMI 计划缺失" }
@@ -333,6 +336,9 @@ internal fun parsePlan(output: String): DevicePlan {
         online = online,
         baseline = baseline,
         current = current,
+        manualSltSupported = optionalField("SLT_SUPPORTED") == "1",
+        manualSltDomains = optionalField("SLT_DOMAINS")?.split(',')
+            .orEmpty().mapNotNull(String::toIntOrNull).toSet(),
     )
 }
 

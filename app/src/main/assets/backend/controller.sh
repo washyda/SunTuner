@@ -16,6 +16,7 @@ work=
 pvc_pid=
 owned_plan=0
 owned_observer=0
+owned_trigger=0
 
 die() { printf 'ERROR %s\n' "$*" >&2; exit 1; }
 
@@ -84,7 +85,8 @@ lock_frequencies() {
             [ "$khz" = 0 ] || die "未选中 policy$policy 的核心"
         else
             case "$khz" in [1-9][0-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;; *) die "锁频值无效" ;; esac
-            grep -qw "$khz" "$cpu/cpufreq/policy$policy/scaling_available_frequencies" || die "policy$policy 不支持 $khz kHz"
+            grep -qw "$khz" "$cpu/cpufreq/policy$policy/scaling_available_frequencies" ||
+                die "policy$policy 不支持 $khz kHz"
         fi
     done
     [ ! -d "$modules/sm8750_stress_qos" ] || die "已有其他任务正在使用锁频模块"
@@ -106,7 +108,7 @@ cleanup() {
     fi
     restore_governors || { printf 'ERROR 调速器恢复失败，刷新时会重新尝试\n' >&2; rc=1; }
     restore_frequency_lock || { printf 'ERROR 临时频率上限清理失败，刷新时会重新尝试\n' >&2; rc=1; }
-    for entry in "sm8750_acd_observer:$owned_observer" "sm8750_scmi_plan_ro:$owned_plan"; do
+    for entry in "sm8750_apns_trigger:$owned_trigger" "sm8750_acd_observer:$owned_observer" "sm8750_scmi_plan_ro:$owned_plan"; do
         name=${entry%:*}
         if [ "${entry#*:}" = 1 ] && [ -d "$modules/$name" ]; then
             rmmod "$name" || { printf 'ERROR 模块卸载失败 %s\n' "$name" >&2; rc=1; }
@@ -123,7 +125,7 @@ check_firmware() {
         [ -d "$cpu/cpufreq/policy6" ] ||
         die "缺少 CPU policy0/policy6 调频接口"
     case "$action" in
-        read|cdt_enable)
+        read|cdt_enable|manual_slt)
             [ -d /sys/bus/scmi_protocol ] || die "缺少 /sys/bus/scmi_protocol 接口" ;;
     esac
 }
@@ -222,16 +224,27 @@ classify_state() {
     case "$cdt_backup_status" in match|enabled_match|mismatch) has_backup=1 ;; esac
 }
 
+stock_baseline_candidate() {
+    case "$cdt_disk" in empty|stock) ;; *) return 1 ;; esac
+    [ "$apns_slot" != external ] &&
+        [ ! -e "$session/manual-slt-0" ] && [ ! -e "$session/manual-slt-1" ] &&
+        [ "$(cat "$persistent/cdt-restore.boot" 2>/dev/null || true)" != "$boot" ]
+}
+
 maybe_persist_stock_baseline() {
-    plan_file=$1
-    if [ "$state" = STOCK_UNMODIFIED ] && [ "$boot_cdt" = not_found ]; then
-        grep '^[01],' "$plan_file" > "$work/stock-rows.tmp" || true
-        if [ "$(wc -l < "$work/stock-rows.tmp")" -eq 32 ]; then
-            cp "$work/stock-rows.tmp" "$persistent/stock-baseline.csv.tmp"
-            mv "$persistent/stock-baseline.csv.tmp" "$persistent/stock-baseline.csv"
-            printf '%s\n' "$boot" > "$persistent/stock-baseline.boot"
-        fi
+    local plan_file="$1" candidate="$persistent/stock-baseline.csv.tmp"
+    stock_baseline_candidate || return 0
+    case "$boot_cdt:$action" in
+        not_found:*|unknown:cdt_enable) ;;
+        *) return 0 ;;
+    esac
+    plan_frequencies "$plan_file" >/dev/null || return 0
+    if { printf '# boot_id=%s\n' "$boot" && grep '^[01],' "$plan_file"; } > "$candidate" &&
+        mv "$candidate" "$persistent/stock-baseline.csv"; then
+        return 0
     fi
+    rm -f -- "$candidate"
+    printf 'WARN 无法保存刷入前的电压计划\n' >&2
 }
 
 load_scmi_module() {
@@ -249,12 +262,82 @@ report() {
     emit_report
 }
 
+manual_slt_supported() {
+    [ "$(getprop ro.product.model)" = PJZ110 ] &&
+        [ "$(getprop ro.soc.model)" = SM8750 ] &&
+        [ "$(uname -r)" = 6.6.118-android15-8-g9bc34d5b0c79-abogki537459655-4k ] &&
+        [ "$(getprop ro.build.fingerprint)" = OnePlus/PJZ110/OP5D0DL1:17/CP2A.260605.016/V.487427a-2227f32-224bc4c:user/release-keys ]
+}
+
+manual_slt() {
+    local target="$1" slot mask marker changed
+    case "$target" in 0) mask=40 ;; 1) mask=01 ;; *) die "无效的 SLT 簇" ;; esac
+    manual_slt_supported || die "当前机型、内核或固件不支持手动 SLT"
+    slot=$(getprop ro.boot.slot_suffix)
+    case "$slot" in _a|_b) ;; *) die "无法确认当前启动槽" ;; esac
+    printf '%s  %s\n' \
+        131bc2ee0f65db270f27fafa6f44d4446a5227a2a3926863ae4d511218efdc3d "/dev/block/by-name/pdp$slot" \
+        4b3d944d9a5304c4817eb06bd901d62b4a833c8b5fd56395f706a93ee9630ca2 "/dev/block/by-name/uefi$slot" |
+        sha256sum -c - >/dev/null || die "当前 PDP 或 UEFI 与已验证的手动 SLT 版本不匹配"
+    [ "$(cat "$cpu/online")" = 0-7 ] || die "手动 SLT 需要八核在线"
+    [ "$(cat "$cpu/cpufreq/policy0/related_cpus")" = "0 1 2 3 4 5" ] &&
+        [ "$(cat "$cpu/cpufreq/policy6/related_cpus")" = "6 7" ] || die "CPU 拓扑与已验证配置不匹配"
+    [ ! -e "$persistent/cdt-orig.bin.transaction" ] || die "请先刷新并处理 CDT 恢复记录"
+    [ ! -d "$modules/sm8750_apns_trigger" ] || die "SLT 模块正在被其他任务使用"
+    prepare_cdt_tool
+    inspect_state
+    case "$state" in CDT_RECOVERY_REQUIRED|CORRUPT_CDT) die "请先检查 CDT 状态" ;; esac
+    load_scmi_module
+    load_owned sm8750_acd_observer "pdp=$target"
+    owned_observer=1
+    stock_slot "$(cat "$modules/sm8750_acd_observer/parameters/snapshot")" ||
+        die "PDP$target 当前完成槽状态无法确认"
+    rmmod sm8750_acd_observer || die "无法卸载 SLT 状态探针"
+    owned_observer=0
+    cp "$bundle/sm8750_apns_trigger.ko" "$work/" || die "缺少 SLT 触发模块"
+    plan > "$work/before" && plan_frequencies "$work/before" > "$work/before.freq" ||
+        die "SLT 前电压计划读回失败"
+    maybe_persist_stock_baseline "$work/before"
+
+    # A failed reply can follow a sent request. Keep this boot's stock baseline protected.
+    marker="$session/manual-slt-$target"
+    if [ ! -e "$marker" ]; then
+        printf 'attempted\n' > "$marker" || die "无法保存 SLT 状态"
+    fi
+    owned_trigger=1
+    taskset "$mask" insmod "$work/sm8750_apns_trigger.ko" "pdp=$target" action=1 ||
+        die "PDP$target SLT 未获固件确认，请刷新电压计划"
+    printf 'accepted\n' > "$marker" || die "SLT 已获固件确认，状态保存失败，请刷新电压计划"
+    rmmod sm8750_apns_trigger || die "SLT 已获固件确认，触发模块卸载失败"
+    owned_trigger=0
+
+    sleep 0.5
+    plan > "$work/current" && plan_frequencies "$work/current" > "$work/current.freq" &&
+        cmp -s "$work/before.freq" "$work/current.freq" ||
+        die "SLT 已获固件确认，电压计划读回失败，请刷新"
+    changed=$(awk -F, -v target="$target" '
+        FNR == NR { if ($1 == target) power[$2] = $4; next }
+        $1 == target && power[$2] != $4 { changed++ }
+        END { print changed + 0 }
+    ' "$work/before" "$work/current")
+    printf 'SLT_CHANGED %s\n' "$changed"
+    prepare_report
+    emit_report
+}
+
 prepare_report() {
     online=$(cat "$cpu/online") || die "无法读取在线 CPU"
     printf '%s\n' "$online" | grep -Eq '^[0-7](-[0-7])?(,[0-7](-[0-7])?)*$' ||
         die "在线 CPU 状态无效"
-    if [ -f "$persistent/stock-baseline.csv" ]; then
-        cp "$persistent/stock-baseline.csv" "$work/baseline" 2>/dev/null || rm -f "$work/baseline"
+    local baseline_file="$persistent/stock-baseline.csv" baseline_boot
+    if [ -f "$baseline_file" ]; then
+        baseline_boot=$(sed -n '1s/^# boot_id=//p' "$baseline_file" 2>/dev/null) || baseline_boot=
+        if [ -z "$baseline_boot" ]; then
+            baseline_boot=$(cat "$persistent/stock-baseline.boot" 2>/dev/null || true)
+        fi
+        if [ "$state" != CDT_WRITTEN ] || [ "$baseline_boot" != "$boot" ]; then
+            cp "$baseline_file" "$work/baseline" 2>/dev/null || rm -f "$work/baseline"
+        fi
     fi
 }
 
@@ -278,7 +361,14 @@ capture_cdt_plan() {
 }
 
 emit_report() {
-    if [ "$state" = STOCK_UNMODIFIED ] && [ "$boot_cdt" = not_found ]; then
+    local slt_supported=0 slt_domains=none domain
+    if manual_slt_supported; then slt_supported=1; fi
+    for domain in 0 1; do
+        if [ "$(cat "$session/manual-slt-$domain" 2>/dev/null || true)" = accepted ]; then
+            if [ "$slt_domains" = none ]; then slt_domains=$domain; else slt_domains="$slt_domains,$domain"; fi
+        fi
+    done
+    if stock_baseline_candidate && [ "$boot_cdt" = not_found ]; then
         baseline_source=current_stock
     elif [ -f "$work/baseline" ]; then
         baseline_source=persisted
@@ -289,6 +379,7 @@ emit_report() {
     printf 'BOOT %s\nSTATE %s\nCDT_DISK %s\nCDT_KEY7 %s\nCDT_HAS_BACKUP %s\nCDT_PLATFORM %s\nBOOT_CDT %s\nBOOT_PLATFORM_INFO %s\nAPNS_SLOT %s\nONLINE %s\nBASELINE_SOURCE %s\n' \
         "$boot" "$state" "$cdt_disk" "$cdt_key7" "$has_backup" "$cdt_platform" \
         "$boot_cdt" "$boot_platform_info" "$apns_slot" "$online" "$baseline_source"
+    printf 'SLT_SUPPORTED %s\nSLT_DOMAINS %s\n' "$slt_supported" "$slt_domains"
 
     if [ "$baseline_source" = persisted ]; then
         printf 'BEGIN baseline\n'
@@ -698,6 +789,9 @@ case "$action" in
             fi
             recover_cdt_if_pending
             cdt_stage restore_and_verify
+            # The running plan can still be from the pre-restore CDT until the next boot.
+            printf '%s\n' "$boot" > "$persistent/cdt-restore.boot" ||
+                printf 'WARN 无法保存本次还原的启动 ID\n' >&2
             run_cdt_operation restore "$cdt_dev" ${extra_arg:+"$extra_arg"}
         elif [ "$action" = cdt_recover ]; then
             [ "$#" -le 1 ] || die "恢复参数无效"
@@ -726,6 +820,9 @@ case "$action" in
 esac
 
 case "$action" in
+    manual_slt)
+        [ "$#" = 2 ] && [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新"
+        manual_slt "$2" ;;
     reboot)
         [ "$#" = 1 ] && [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新"
         /system/bin/svc power reboot --no-wait ;;

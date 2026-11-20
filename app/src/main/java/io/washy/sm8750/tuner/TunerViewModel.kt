@@ -8,12 +8,18 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-internal enum class Operation { READING, EXPORTING_DIAGNOSTICS, WRITING_CDT, BACKUP_CDT, REBOOTING, LOADING }
+internal enum class Operation {
+    READING, EXPORTING_DIAGNOSTICS, WRITING_CDT, BACKUP_CDT, REBOOTING, LOADING, GAME_TEST, MANUAL_SLT;
+
+    val isLoad: Boolean get() = this == LOADING || this == GAME_TEST
+}
 
 internal enum class RebootPrompt { ENABLED_CDT, RESTORED_CDT }
 
@@ -50,11 +56,14 @@ internal data class ScreenState(
     val workload: WorkloadKind = WorkloadKind.FP,
     val fixedFrequencies: Map<Int, Int> = emptyMap(),
     val lastRun: LoadRun? = null,
+    val gameSession: GameSession? = null,
+    val gameResult: GameResult? = null,
+    val sltChanges: Map<Int, Int> = emptyMap(),
 ) {
     val config: LoadConfig?
         get() {
             val threadCount = threads.toIntOrNull() ?: return null
-            val duration = seconds.toIntOrNull() ?: return null
+            val duration = seconds.toIntOrNull()?.takeIf { it >= 5 } ?: return null
             val domains = cores.map(::domainFor).toSet()
             val targets = if (frequencyMode == FrequencyMode.FIXED) domains.mapNotNull { domain ->
                 val levels = plan?.current.orEmpty().filter { it.domain == domain }
@@ -68,12 +77,17 @@ internal data class ScreenState(
 
 internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     private val backend = RootBackend(app)
+    private val gameStore = GameResultStore(app)
     private val thermal = app.getSystemService(PowerManager::class.java)
     private val _state = MutableStateFlow(ScreenState(hasCdtFailureLog = backend.hasCdtFailureLog))
     val state = _state.asStateFlow()
     private var control: LoadControl? = null
 
     init {
+        viewModelScope.launch(Dispatchers.IO) {
+            val saved = gameStore.read()
+            _state.update { if (it.gameSession == null && it.gameResult == null) it.copy(gameResult = saved) else it }
+        }
         // The legacy refresh loads PJZ110-specific probe modules.
         if (Build.MODEL.equals("PJZ110", ignoreCase = true)) refresh()
     }
@@ -111,6 +125,18 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     fun checkCompatibility() = launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在检测兼容性…") {
         val report = backend.collectDiagnostics()
         _state.update { it.copy(compatibilityReport = report, diagnosticsSaved = false) }
+    }
+
+    fun startManualSlt(domain: Int) {
+        val snapshot = _state.value
+        val device = snapshot.plan ?: return
+        if (!device.manualSltSupported || snapshot.cdtUncertain || domain !in 0..1) return
+        launchOperation(Operation.MANUAL_SLT, "正在对 PDP$domain 执行一次 SLT…") {
+            _state.update { it.copy(sltChanges = it.sltChanges - domain) }
+            val result = backend.runManualSlt(device.bootId, domain)
+            updatePlan(result.plan)
+            _state.update { it.copy(sltChanges = it.sltChanges + (domain to result.changed)) }
+        }
     }
 
     fun exportDiagnostics(destination: Uri) {
@@ -251,8 +277,6 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
         launchOperation(Operation.LOADING, "正在准备压测…") {
             val session = LoadControl()
             control = session
-            var firstPolicy: String? = null
-            var ticks = 0
             try {
                 val fresh = backend.read()
                 updatePlan(fresh)
@@ -261,17 +285,7 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
                         fresh.current == device.current && fresh.online.containsAll(config.cores),
                 ) { "电压计划或在线核心已变化，请刷新后重试" }
                 val thermalStart = thermal?.currentThermalStatus
-                val stats = backend.runLoad(fresh, config, session) { line ->
-                    if (line.startsWith("PROGRESS ")) {
-                        val policy = line.substringAfter(' ').substringBefore(' ')
-                        // The worker emits one line per active policy each second.
-                        if (firstPolicy == null) firstPolicy = policy
-                        if (policy == firstPolicy) {
-                            ticks = (ticks + 1).coerceAtMost(config.seconds)
-                            _state.update { it.copy(loadPhaseElapsedSec = ticks) }
-                        }
-                    }
-                } ?: return@launchOperation
+                val stats = runTimedLoad(fresh, config, session) ?: return@launchOperation
                 val thermalEnd = thermal?.currentThermalStatus
                 val after = backend.read()
                 updatePlan(after)
@@ -283,6 +297,100 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update { it.copy(lastRun = run) }
             } finally {
                 control = null
+            }
+        }
+    }
+
+    fun startGameTest() = launchOperation(Operation.GAME_TEST, "准备稳定性测试…") {
+        val session = GameSession()
+        _state.update { it.copy(gameSession = session, gameResult = GameResult(GameOutcome.RUNNING)) }
+        try {
+            val result = withContext(Dispatchers.IO) { runGameTest(session) }
+            _state.update { it.copy(gameResult = result) }
+            withContext(Dispatchers.IO) { gameStore.write(result) }
+        } finally {
+            session.stopped = true
+            _state.update {
+                val result = it.gameResult?.let { current ->
+                    if (current.outcome == GameOutcome.RUNNING) current.copy(outcome = GameOutcome.INTERRUPTED)
+                    else current
+                }
+                it.copy(gameSession = null, gameResult = result)
+            }
+        }
+    }
+
+    private suspend fun runGameTest(session: GameSession): GameResult {
+        val start = System.nanoTime()
+        gameStore.write(GameResult(GameOutcome.RUNNING))
+        var lastProgress = 0
+        val cpu = GameCpuWorkers(session)
+        try {
+            backend.startGameTrace(cpu.awaitTids()).use { trace ->
+                trace.awaitReady()
+                while (!session.stopped && session.failure.get() == null && session.lastFrameNs == 0L &&
+                    System.nanoTime() - start < 12_000_000_000L
+                ) delay(20)
+                if (!session.stopped && session.lastFrameNs == 0L) {
+                    session.failure.compareAndSet(null, "GPU 场景启动超时")
+                }
+                if (session.lastFrameNs != 0L && session.failure.get() == null && !session.stopped) {
+                    session.beginNs = System.nanoTime()
+                    while (!session.stopped && session.failure.get() == null) {
+                        val now = System.nanoTime()
+                        val elapsedMs = session.elapsedMs(now)
+                        if (now - session.lastFrameNs > 3_000_000_000L) {
+                            session.failure.compareAndSet(null, "GPU 场景连续 3 秒无新帧")
+                            break
+                        }
+                        val elapsed = (elapsedMs / 1000).toInt()
+                        if (elapsed == GAME_SECONDS) break
+                        gameBurst(elapsedMs, session.workerCount)?.let(cpu::pulse)
+                        if (elapsed > lastProgress) {
+                            lastProgress = elapsed
+                            val progress = GameResult(GameOutcome.RUNNING, elapsed, gameRounds(elapsedMs))
+                            _state.update { it.copy(gameResult = progress) }
+                            if (elapsed % 4 == 0) gameStore.write(progress)
+                        }
+                        delay(12)
+                    }
+                }
+                val end = System.nanoTime()
+                val userStopped = session.stopped
+                val elapsedMs = session.elapsedMs(end)
+                session.stopped = true
+                trace.close()
+                val coverage = if (session.beginNs != 0L) trace.coverage(session.beginNs, end, session.gpuSpans()) else null
+                val error = session.failure.get()
+                val outcome = when {
+                    error != null -> GameOutcome.FAILED
+                    userStopped -> GameOutcome.STOPPED
+                    else -> GameOutcome.COMPLETED
+                }
+                return GameResult(outcome, (elapsedMs / 1000).toInt(), gameRounds(elapsedMs), coverage, error)
+            }
+        } finally {
+            session.stopped = true
+            cpu.close()
+        }
+    }
+
+    fun stopGameTest() {
+        _state.value.gameSession?.stopped = true
+    }
+
+    private suspend fun runTimedLoad(device: DevicePlan, config: LoadConfig, session: LoadControl): LoadStats? {
+        var firstPolicy: String? = null
+        var ticks = 0
+        return backend.runLoad(device, config, session) { line ->
+            if (line.startsWith("PROGRESS ")) {
+                val policy = line.substringAfter(' ').substringBefore(' ')
+                // The worker emits one line per active policy each second.
+                if (firstPolicy == null) firstPolicy = policy
+                if (policy == firstPolicy) {
+                    ticks = (ticks + 1).coerceAtMost(config.seconds)
+                    _state.update { it.copy(loadPhaseElapsedSec = ticks) }
+                }
             }
         }
     }
@@ -305,6 +413,7 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
             plan = plan,
             cores = cores.ifEmpty { setOfNotNull(plan.online.firstOrNull()) },
             lastRun = it.lastRun.takeIf { run -> sameBoot && run?.plan == plan.current },
+            sltChanges = if (sameBoot) it.sltChanges else emptyMap(),
         )
     }
 

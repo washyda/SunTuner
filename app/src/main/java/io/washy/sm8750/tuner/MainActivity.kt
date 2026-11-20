@@ -50,6 +50,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.washy.sm8750.tuner.ui.BenchmarkScreen
 import io.washy.sm8750.tuner.ui.CompatibilityScreen
+import io.washy.sm8750.tuner.ui.GameScenarioScreen
 import io.washy.sm8750.tuner.ui.TunerTheme
 import io.washy.sm8750.tuner.ui.TunerThemeTokens
 import io.washy.sm8750.tuner.ui.VoltageScreen
@@ -72,7 +73,9 @@ class MainActivity : ComponentActivity() {
                 ActivityResultContracts.CreateDocument("application/octet-stream"),
             ) { uri -> uri?.let(model::backupCdt) }
             LaunchedEffect(state.operation) {
-                if (state.operation == Operation.LOADING || state.operation == Operation.WRITING_CDT) {
+                if (state.operation?.isLoad == true ||
+                    state.operation == Operation.WRITING_CDT || state.operation == Operation.MANUAL_SLT
+                ) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 } else {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -99,6 +102,7 @@ class MainActivity : ComponentActivity() {
                     },
                     onDismissCdtBackupResult = model::dismissCdtBackupResult,
                     onEnableCdt = model::enableCdt,
+                    onManualSlt = model::startManualSlt,
                     onRestoreCdt = { model.restoreCdt(fallbackClean = false) },
                     onRestoreFallbackClean = { model.restoreCdt(fallbackClean = true) },
                     onDismissRestoreNoBackup = model::dismissRestoreNoBackup,
@@ -113,6 +117,8 @@ class MainActivity : ComponentActivity() {
                     onWorkload = model::setWorkload,
                     onFrequency = model::setFixedFrequency,
                     onStart = model::startLoad,
+                    onStartGame = model::startGameTest,
+                    onStopGame = model::stopGameTest,
                     onStop = model::stopLoad,
                 )
             }
@@ -120,6 +126,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        model.stopGameTest()
         if (!isChangingConfigurations) model.stopLoad()
         super.onStop()
     }
@@ -138,6 +145,7 @@ private fun TunerApp(
     onBackupCdt: () -> Unit,
     onDismissCdtBackupResult: () -> Unit,
     onEnableCdt: () -> Unit,
+    onManualSlt: (Int) -> Unit,
     onRestoreCdt: () -> Unit,
     onRestoreFallbackClean: () -> Unit,
     onDismissRestoreNoBackup: () -> Unit,
@@ -152,9 +160,16 @@ private fun TunerApp(
     onWorkload: (WorkloadKind) -> Unit,
     onFrequency: (Int, Int) -> Unit,
     onStart: () -> Unit,
+    onStartGame: () -> Unit,
+    onStopGame: () -> Unit,
     onStop: () -> Unit,
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
+
+    state.gameSession?.let { game ->
+        GameScenarioScreen(game, state.gameResult?.elapsed ?: 0, onStopGame)
+        return
+    }
 
     state.compatibilityReport?.let { report ->
         CompatibilityScreen(
@@ -242,10 +257,10 @@ private fun TunerApp(
         },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            if (state.operation != null && state.operation != Operation.LOADING) {
+            if (state.operation != null && !state.operation.isLoad) {
                 LinearProgressIndicator(Modifier.fillMaxWidth())
             }
-            if (state.operation != null && state.operation != Operation.LOADING && state.status != null) {
+            if (state.operation != null && !state.operation.isLoad && state.status != null) {
                 Text(
                     state.status,
                     Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
@@ -289,6 +304,7 @@ private fun TunerApp(
                         onCheckCompatibility = onCheckCompatibility,
                         onBackupCdt = onBackupCdt,
                         onEnableCdt = onEnableCdt,
+                        onManualSlt = onManualSlt,
                         onRestoreCdt = onRestoreCdt,
                         onRebootNow = onRebootNow,
                     )
@@ -304,6 +320,7 @@ private fun TunerApp(
                         onWorkload = onWorkload,
                         onFrequency = onFrequency,
                         onStart = onStart,
+                        onStartGame = onStartGame,
                         onStop = onStop,
                     )
                 }
@@ -372,9 +389,11 @@ private fun TunerPreview() {
             onExportCdtFailureLog = {}, onDismissCdtLogExportResult = {},
             onBackupCdt = {}, onDismissCdtBackupResult = {},
             onEnableCdt = {}, onRestoreCdt = {}, onRestoreFallbackClean = {},
+            onManualSlt = {},
             onDismissRestoreNoBackup = {}, onRebootNow = {}, onDismissReboot = {},
             onPreset = {}, onCore = {}, onThreads = {}, onSeconds = {}, onQuickSeconds = {},
             onMode = {}, onWorkload = {}, onFrequency = { _, _ -> }, onStart = {}, onStop = {},
+            onStartGame = {}, onStopGame = {},
         )
     }
 }
