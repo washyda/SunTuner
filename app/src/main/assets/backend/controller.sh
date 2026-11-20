@@ -158,8 +158,12 @@ sm8850_plan_supported() {
 }
 
 sm8850_cdt_ready() {
-    [ "$state" = STOCK_UNMODIFIED ] && [ "$cdt_v6_can_enable" = 1 ] &&
-        [ "$boot_cdt" = not_found ] && stock_baseline_candidate
+    [ "$state" = STOCK_UNMODIFIED ] && stock_baseline_candidate || return 1
+    case "$cdt_disk:$boot_platform_info" in
+        empty:6,*) return 0 ;;
+        stock:*) [ "$cdt_v6_can_enable" = 1 ] ;;
+        *) return 1 ;;
+    esac
 }
 
 sm8850_boost_frequencies() {
@@ -313,6 +317,7 @@ maybe_persist_stock_baseline() {
     stock_baseline_candidate || return 0
     case "$boot_cdt:$action" in
         not_found:*|unknown:cdt_enable) ;;
+        applied:cdt_enable) is_sm8850 || return 0 ;;
         *) return 0 ;;
     esac
     plan_frequencies "$plan_file" >/dev/null || return 0

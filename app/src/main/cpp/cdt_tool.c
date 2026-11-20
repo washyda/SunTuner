@@ -1,5 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#include <strings.h>
+#endif
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -541,6 +545,11 @@ static const char *detect_boot_cdt_state(platform_hint_t *hint) {
             }
             hint->present = 1;
             hint->ver = 5;
+#ifdef __ANDROID__
+            char soc[PROP_VALUE_MAX];
+            if (__system_property_get("ro.soc.model", soc) > 0 && strcasecmp(soc, "SM8850") == 0)
+                hint->ver = 6;
+#endif
             hint->platform_id = 8; /* MTP verified in XBL FALLBACK_RECORD 0x148D28B0 */
             hint->major = (uint8_t)((ver_num >> 16) & 0xffu);
             hint->minor = (uint8_t)(ver_num & 0xffu);
