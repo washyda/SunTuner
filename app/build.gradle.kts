@@ -14,8 +14,8 @@ android {
         applicationId = "io.washy.sm8750.tuner"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("9").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.5beta").get()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("10").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.6beta").get()
     }
 
     buildTypes {

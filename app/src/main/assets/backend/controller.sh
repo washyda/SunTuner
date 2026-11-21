@@ -135,26 +135,17 @@ check_sm8850_policies() {
         die "当前 SM8850 的 CPU 簇布局与 6+2 适配不匹配"
 }
 
-# Both SM8850 assets use the Android 16 / 6.12 GKI generation 6 ABI and 4 KB pages.
-sm8850_kernel_supported() {
-    case "$(uname -r)" in
-        6.12.*-android16-6-*-4k|6.12.*-android16-6-*-4k-*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 stress_qos_asset() {
     if is_sm8850; then
-        sm8850_kernel_supported &&
-            [ -r "$bundle/sm8850_stress_qos.ko" ] || return 1
+        [ -r "$bundle/sm8850_stress_qos.ko" ] || return 1
         printf '%s\n' sm8850_stress_qos.ko
     else
         printf '%s\n' sm8750_stress_qos.ko
     fi
 }
 
-sm8850_plan_supported() {
-    sm8850_kernel_supported && [ -r "$bundle/sm8850_scmi_plan_ro.ko" ]
+sm8850_plan_asset_present() {
+    [ -r "$bundle/sm8850_scmi_plan_ro.ko" ]
 }
 
 sm8850_cdt_ready() {
@@ -193,7 +184,7 @@ read_sm8850_frequencies() {
     printf 'BOOT %s\n' "$(cat "$boot_file")"
     printf 'ONLINE %s\n' "$(cat "$cpu/online")"
     if stress_qos_asset >/dev/null; then printf 'FIXED 1\n'; else printf 'FIXED 0\n'; fi
-    if sm8850_plan_supported; then printf 'VOLTAGE 1\n'; else printf 'VOLTAGE 0\n'; fi
+    if sm8850_plan_asset_present; then printf 'VOLTAGE 1\n'; else printf 'VOLTAGE 0\n'; fi
     sm8850_cpu_frequencies
 }
 
@@ -333,7 +324,7 @@ maybe_persist_stock_baseline() {
 load_scmi_module() {
     local asset=sm8750_scmi_plan_ro.ko
     if is_sm8850; then
-        sm8850_plan_supported || die "当前 SM8850 内核缺少匹配的电压读表模块"
+        sm8850_plan_asset_present || die "缺少 SM8850 电压读表模块"
         asset=sm8850_scmi_plan_ro.ko
     fi
     [ -r "$bundle/$asset" ] || die "缺少 $asset"
@@ -750,8 +741,8 @@ print_cdt_write_log() {
 }
 
 read_sm8850_perf() {
-    if ! sm8850_plan_supported; then
-        printf 'SCMI_PERF=kernel_not_supported\n'
+    if ! sm8850_plan_asset_present; then
+        printf 'SCMI_PERF=module_missing\n'
         return 1
     fi
     if [ -d "$modules/sm8750_scmi_plan_ro" ]; then
