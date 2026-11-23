@@ -2,7 +2,6 @@
 
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
-#include <strings.h>
 #endif
 #include <ctype.h>
 #include <errno.h>
@@ -11,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -32,8 +32,14 @@ typedef struct {
     uint16_t size;
 } cdt_desc_t;
 
+typedef enum {
+    PLATFORM_UNKNOWN = 0,
+    PLATFORM_IDENTIFIED,
+    PLATFORM_NO_DEFAULT,
+} platform_state_t;
+
 typedef struct {
-    int present;
+    platform_state_t state;
     uint8_t ver;
     uint8_t platform_id;
     uint8_t major;
@@ -488,6 +494,28 @@ static void trim_ws(char *s) {
     while (len > 0 && isspace((unsigned char)s[len - 1])) s[--len] = '\0';
 }
 
+static uint8_t default_cdt_version(void) {
+#ifdef __ANDROID__
+    char soc[PROP_VALUE_MAX];
+    if (__system_property_get("ro.soc.model", soc) > 0) {
+        if (strcasecmp(soc, "SM8750") == 0) return 5;
+        if (strcasecmp(soc, "SM8850") == 0 || strcasecmp(soc, "SM8850P") == 0) return 6;
+    }
+#endif
+    return 0;
+}
+
+static int resolve_empty_cdt_hint(platform_hint_t *hint) {
+    uint8_t default_version = default_cdt_version();
+    if (hint->state == PLATFORM_UNKNOWN && default_version) {
+        *hint = (platform_hint_t){
+            .state = PLATFORM_IDENTIFIED, .ver = default_version, .platform_id = 8, .major = 1,
+        };
+    }
+    return hint->state == PLATFORM_IDENTIFIED && hint->ver >= 4 &&
+           (default_version != 6 || hint->ver == 6);
+}
+
 static const char *detect_boot_cdt_state(platform_hint_t *hint) {
     static char boot_buf[262144];
     memset(hint, 0, sizeof(*hint));
@@ -504,7 +532,7 @@ static const char *detect_boot_cdt_state(platform_hint_t *hint) {
                        &v, &p, &maj, &min, &sub) == 5 &&
                 v <= 255 && p <= 255 && maj <= 255 && min <= 255 && sub <= 255) {
                 saw_version = 1;
-                hint->present = 1;
+                hint->state = PLATFORM_IDENTIFIED;
                 hint->ver = (uint8_t)v;
                 hint->platform_id = (uint8_t)p;
                 hint->major = (uint8_t)maj;
@@ -531,10 +559,11 @@ static const char *detect_boot_cdt_state(platform_hint_t *hint) {
         }
     }
 
-    if (!hint->present) {
+    if (hint->state == PLATFORM_UNKNOWN) {
         char hw[64] = {0}, pver[64] = {0}, sub[64] = {0};
         if (read_small_text("/sys/devices/soc0/hw_platform", hw, sizeof(hw)) == 0) trim_ws(hw);
-        if (strcmp(hw, "MTP") == 0 || saw_mtp) {
+        int hw_unknown = hw[0] == '\0' || strcasecmp(hw, "Unknown") == 0;
+        if (strcasecmp(hw, "MTP") == 0 || (hw_unknown && saw_mtp)) {
             unsigned long ver_num = 0x10000UL;
             unsigned long sub_num = 0UL;
             if (read_small_text("/sys/devices/soc0/platform_version", pver, sizeof(pver)) == 0) {
@@ -543,18 +572,16 @@ static const char *detect_boot_cdt_state(platform_hint_t *hint) {
             if (read_small_text("/sys/devices/soc0/platform_subtype_id", sub, sizeof(sub)) == 0) {
                 sub_num = strtoul(sub, NULL, 0);
             }
-            hint->present = 1;
-            hint->ver = 5;
-#ifdef __ANDROID__
-            char soc[PROP_VALUE_MAX];
-            if (__system_property_get("ro.soc.model", soc) > 0 && strcasecmp(soc, "SM8850") == 0)
-                hint->ver = 6;
-#endif
+            hint->state = PLATFORM_IDENTIFIED;
+            hint->ver = default_cdt_version();
+            if (!hint->ver) hint->ver = 5;
             hint->platform_id = 8; /* MTP verified in XBL FALLBACK_RECORD 0x148D28B0 */
             hint->major = (uint8_t)((ver_num >> 16) & 0xffu);
             hint->minor = (uint8_t)(ver_num & 0xffu);
             hint->subtype = (uint8_t)(sub_num & 0xffu);
             hint->fusion = 0;
+        } else if (!hw_unknown) {
+            hint->state = PLATFORM_NO_DEFAULT;
         }
     }
 
@@ -638,7 +665,7 @@ static int build_cdt_with_key7(
             *out_img = img;
             return 0;
         }
-        if (!hint->present) {
+        if (hint->state != PLATFORM_IDENTIFIED) {
             free(img);
             errno = ENODEV;
             return -1;
@@ -705,7 +732,7 @@ static int build_cdt_with_key7(
         }
     }
     if (!set_key7 && new_count == 0 && only_block0_active &&
-        parsed->version == 5 && parsed->fusion == 0 && hint->present &&
+        parsed->version == 5 && parsed->fusion == 0 && hint->state == PLATFORM_IDENTIFIED &&
         parsed->platform_id == hint->platform_id && parsed->major == hint->major &&
         parsed->minor == hint->minor && parsed->subtype == hint->subtype) {
         /* Fallback clean stock when partition originally held only our injected Key 7 record. */
@@ -783,11 +810,10 @@ static const char *compare_backup(const uint8_t *backup, size_t backup_len,
                 active.state == DISK_SLT_ENABLED && active.key7_val == 1) {
                 platform_hint_t hint = {0};
                 if (parsed.state == DISK_EMPTY) {
-                    detect_boot_cdt_state(&hint);
-                    if (!hint.present) {
-                        hint = (platform_hint_t){1, active.version, active.platform_id, active.major,
-                                                 active.minor, active.subtype, active.fusion};
-                    }
+                    /* The empty original has no header. Match the whole canonical image
+                     * using its on-disk header, independently of this boot's runtime data. */
+                    hint = (platform_hint_t){PLATFORM_IDENTIFIED, active.version, active.platform_id,
+                                             active.major, active.minor, active.subtype, active.fusion};
                 }
                 uint8_t *expected = NULL;
                 if (build_cdt_with_key7(backup, len, &parsed, &hint, 1, 1, &expected) == 0) {
@@ -816,7 +842,7 @@ static const char *backup_status(const char *path, const uint8_t *current, size_
     return status;
 }
 
-static void print_disk_status(const uint8_t *buf, size_t len, const char *original_status) {
+static disk_state_t print_disk_status(const uint8_t *buf, size_t len, const char *original_status) {
     cdt_parsed_t parsed;
     parse_cdt(buf, len, &parsed);
     printf("CDT_SIZE=%zu\n", len);
@@ -847,6 +873,7 @@ static void print_disk_status(const uint8_t *buf, size_t len, const char *origin
         printf("CDT_PLATFORM=none\n");
         printf("CDT_KEYS=none\n");
     }
+    return parsed.state;
 }
 
 static int cmd_status(const char *dev_path, const char *backup_path) {
@@ -857,17 +884,20 @@ static int cmd_status(const char *dev_path, const char *backup_path) {
         return 1;
     }
     printf("CDT_DEV=%s\n", dev_path);
-    print_disk_status(buf, len, backup_status(backup_path, buf, len));
+    disk_state_t disk_state = print_disk_status(buf, len, backup_status(backup_path, buf, len));
     free(buf);
 
     platform_hint_t hint;
     const char *boot_state = detect_boot_cdt_state(&hint);
     printf("BOOT_CDT=%s\n", boot_state);
-    if (hint.present) {
+    if (hint.state == PLATFORM_IDENTIFIED) {
         printf("BOOT_PLATFORM_INFO=%u,%u,%u,%u,%u,%u\n",
                hint.ver, hint.platform_id, hint.major, hint.minor, hint.subtype, hint.fusion);
     } else {
         printf("BOOT_PLATFORM_INFO=unknown\n");
+    }
+    if (disk_state == DISK_EMPTY) {
+        printf("CDT_EMPTY_CAN_ENABLE=%d\n", resolve_empty_cdt_hint(&hint));
     }
     return 0;
 }
@@ -904,6 +934,18 @@ static int cmd_enable_with_hint(
         return 0;
     }
 
+    platform_hint_t detected;
+    if (override_hint) {
+        detected = *override_hint;
+    } else {
+        detect_boot_cdt_state(&detected);
+    }
+    if (parsed.state == DISK_EMPTY && !resolve_empty_cdt_hint(&detected)) {
+        free(buf);
+        fprintf(stderr, "CDT_ERR=empty_platform_unsupported\n");
+        return 4;
+    }
+
     /* Persist original unmodified partition ONCE; never overwrite with a Key7!=0 image. */
     if (strcmp(original, "missing") == 0 && parsed.state != DISK_SLT_ENABLED) {
         if (save_backup_atomic(backup_path, buf, len) != 0) {
@@ -913,13 +955,6 @@ static int cmd_enable_with_hint(
             return 3;
         }
         original = "match";
-    }
-
-    platform_hint_t detected;
-    if (override_hint) {
-        detected = *override_hint;
-    } else {
-        detect_boot_cdt_state(&detected);
     }
 
     uint8_t *new_img = NULL;
@@ -1079,7 +1114,7 @@ static int cmd_selftest(void) {
     if (!f || fwrite(zeros, 1, part_size, f) != part_size) return 1;
     fclose(f);
 
-    platform_hint_t mtp = {1, 5, 8, 1, 0, 0, 0};
+    platform_hint_t mtp = {PLATFORM_IDENTIFIED, 5, 8, 1, 0, 0, 0};
     if (cmd_enable_with_hint(dev, bak, &mtp) != 0) return 1;
 
     uint8_t *enabled = NULL;

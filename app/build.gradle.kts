@@ -14,8 +14,8 @@ android {
         applicationId = "io.washy.sm8750.tuner"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("12").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.7beta").get()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("13").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.8beta").get()
     }
 
     buildTypes {
@@ -96,26 +96,7 @@ val buildLoadWorker = registerNativeBinary(
 val buildCdtTool = registerNativeBinary("buildCdtTool", "src/main/cpp/cdt_tool.c", "cdt_tool")
 val buildCrashLogFilter = registerNativeBinary("buildCrashLogFilter", "src/main/cpp/crash_log_filter.c", "crash_log_filter")
 android.sourceSets["main"].assets.directories.addAll(listOf(generatedAssets.get().asFile.path, generatedNativeAssets.get().asFile.path))
-val gameNativeLibs = layout.buildDirectory.dir("generated/game-native-libs")
-val buildGameGpuClock by tasks.registering(Exec::class) {
-    val source = file("src/main/cpp/game_gpu_clock.c")
-    val library = gameNativeLibs.map { it.file("arm64-v8a/libgame_gpu_clock.so") }
-    inputs.file(source)
-    inputs.property("ndkPath", ndk)
-    outputs.file(library)
-    doFirst {
-        val toolchain = file("${ndk.get()}/toolchains/llvm/prebuilt").listFiles()!!.single { it.isDirectory }
-        val clang = toolchain.resolve("bin/clang" + if (System.getProperty("os.name").startsWith("Windows")) ".exe" else "")
-        library.get().asFile.parentFile.mkdirs()
-        commandLine(
-            clang.absolutePath, "--target=aarch64-linux-android30", "-std=c17", "-O2",
-            "-shared", "-fPIC", "-Wall", "-Wextra", "-Werror", "-Wl,-z,max-page-size=16384",
-            source.absolutePath, "-lEGL", "-lGLESv3", "-o", library.get().asFile.absolutePath,
-        )
-    }
-}
-android.sourceSets["main"].jniLibs.directories.add(gameNativeLibs.get().asFile.path)
-tasks.named("preBuild") { dependsOn(generateBackend, buildLoadWorker, buildCdtTool, buildCrashLogFilter, buildGameGpuClock) }
+tasks.named("preBuild") { dependsOn(generateBackend, buildLoadWorker, buildCdtTool, buildCrashLogFilter) }
 
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2026.03.00"))

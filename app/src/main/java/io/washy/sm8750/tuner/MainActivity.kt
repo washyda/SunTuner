@@ -51,7 +51,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.washy.sm8750.tuner.ui.BenchmarkScreen
 import io.washy.sm8750.tuner.ui.CompatibilityScreen
 import io.washy.sm8750.tuner.ui.CrashLogScreen
-import io.washy.sm8750.tuner.ui.GameScenarioScreen
 import io.washy.sm8750.tuner.ui.TunerTheme
 import io.washy.sm8750.tuner.ui.TunerThemeTokens
 import io.washy.sm8750.tuner.ui.VoltageScreen
@@ -77,7 +76,7 @@ class MainActivity : ComponentActivity() {
                 uri?.let { model.restoreCdt(source = it) }
             }
             LaunchedEffect(state.operation) {
-                if (state.operation?.isLoad == true ||
+                if (state.operation == Operation.LOADING ||
                     state.operation == Operation.WRITING_CDT
                 ) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -121,8 +120,6 @@ class MainActivity : ComponentActivity() {
                     onWorkload = model::setWorkload,
                     onFrequency = model::setFixedFrequency,
                     onStart = model::startLoad,
-                    onStartGame = model::startGameTest,
-                    onStopGame = model::stopGameTest,
                     onStop = model::stopLoad,
                     crashLogContent = {
                         val logs by model.crashLogState.collectAsStateWithLifecycle()
@@ -135,7 +132,6 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        model.stopGameTest()
         if (!isChangingConfigurations) model.stopLoad()
         super.onStop()
     }
@@ -169,17 +165,10 @@ private fun TunerApp(
     onWorkload: (WorkloadKind) -> Unit,
     onFrequency: (Int, Int) -> Unit,
     onStart: () -> Unit,
-    onStartGame: () -> Unit,
-    onStopGame: () -> Unit,
     onStop: () -> Unit,
     crashLogContent: @Composable () -> Unit = {},
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
-
-    state.gameSession?.let { game ->
-        GameScenarioScreen(game, state.gameResult?.elapsed ?: 0, onStopGame)
-        return
-    }
 
     state.compatibilityReport?.let { report ->
         CompatibilityScreen(
@@ -278,10 +267,10 @@ private fun TunerApp(
             return@Scaffold
         }
         Column(Modifier.fillMaxSize().padding(padding)) {
-            if (state.operation != null && !state.operation.isLoad) {
+            if (state.operation != null && state.operation != Operation.LOADING) {
                 LinearProgressIndicator(Modifier.fillMaxWidth())
             }
-            if (state.operation != null && !state.operation.isLoad && state.status != null) {
+            if (state.operation != null && state.operation != Operation.LOADING && state.status != null) {
                 Text(
                     state.status,
                     Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
@@ -341,7 +330,6 @@ private fun TunerApp(
                         onWorkload = onWorkload,
                         onFrequency = onFrequency,
                         onStart = onStart,
-                        onStartGame = onStartGame,
                         onStop = onStop,
                     )
                 }
@@ -432,7 +420,6 @@ private fun TunerPreview() {
             onDismissRestoreNoBackup = {}, onRebootNow = {}, onDismissReboot = {},
             onPreset = {}, onCore = {}, onThreads = {}, onSeconds = {}, onQuickSeconds = {},
             onMode = {}, onWorkload = {}, onFrequency = { _, _ -> }, onStart = {}, onStop = {},
-            onStartGame = {}, onStopGame = {},
         )
     }
 }

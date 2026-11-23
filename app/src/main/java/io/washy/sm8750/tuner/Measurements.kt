@@ -65,15 +65,16 @@ internal fun parseBenchmarkDevice(output: String): BenchmarkDevice {
     val online = value("ONLINE").split(',').flatMap {
         it.substringBefore('-').toInt()..it.substringAfter('-', it).toInt()
     }.toSet()
-    val frequencies = listOf(0, 6).mapIndexed { domain, policy ->
+    val bootId = value("BOOT")
+    require(bootId.isNotBlank() && online.isNotEmpty() && online.all { it in 0..7 }) { "CPU 拓扑读回不完整" }
+    val frequencies = online.map(::domainFor).toSet().associateWith { domain ->
+        val policy = if (domain == 0) 0 else 6
         val points = value("POLICY $policy").split(Regex("\\s+")).map(String::toInt)
         require(points.isNotEmpty() && points.all { it > 0 }) {
             "policy$policy 的系统频点表无效"
         }
-        domain to points.distinct().sorted()
-    }.toMap()
-    val bootId = value("BOOT")
-    require(bootId.isNotBlank() && online.isNotEmpty() && online.all { it in 0..7 }) { "CPU 拓扑读回不完整" }
+        points.distinct().sorted()
+    }
     return BenchmarkDevice(bootId, online, frequencies, value("FIXED") == "1", value("VOLTAGE") == "1")
 }
 
@@ -361,7 +362,7 @@ internal fun parsePlan(output: String): DevicePlan {
         baseline = baseline,
         current = current,
         sm8850 = sm8850,
-        cdtFlashSupported = !sm8850 || optionalField("CDT_FLASH_SUPPORTED") == "1",
+        cdtFlashSupported = optionalField("CDT_FLASH_SUPPORTED")?.let { it == "1" } ?: !sm8850,
         cdtPendingReboot = optionalField("CDT_PENDING_REBOOT") == "1",
     )
 }

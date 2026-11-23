@@ -121,15 +121,21 @@ cleanup() {
 
 is_sm8850() {
     case "$(getprop ro.soc.model)" in
-        [sS][mM]8850) return 0 ;;
+        [sS][mM]8850|[sS][mM]8850[pP]) return 0 ;;
         *) return 1 ;;
     esac
 }
 
-check_sm8850_policies() {
-    [ "$(cat "$cpu/cpufreq/policy0/related_cpus")" = '0 1 2 3 4 5' ] &&
-        [ "$(cat "$cpu/cpufreq/policy6/related_cpus")" = '6 7' ] ||
-        die "当前 SM8850 的 CPU 簇布局与 6+2 适配不匹配"
+sm8850_policy_cores() {
+    case "$1" in
+        0) printf '%s\n' '0 1 2 3 4 5' ;;
+        6) printf '%s\n' '6 7' ;;
+    esac
+}
+
+check_sm8850_policy() {
+    [ "$(cat "$cpu/cpufreq/policy$1/related_cpus" 2>/dev/null)" = "$(sm8850_policy_cores "$1")" ] ||
+        die "policy$1 的 CPU 簇布局与 SM8850 6+2 适配不匹配"
 }
 
 kernel_page_size() {
@@ -165,9 +171,9 @@ kernel_module_asset() {
 
 sm8850_cdt_ready() {
     [ "$state" = STOCK_UNMODIFIED ] && stock_baseline_candidate || return 1
-    case "$cdt_disk:$boot_platform_info" in
-        empty:6,*) return 0 ;;
-        stock:*) [ "$cdt_v6_can_enable" = 1 ] ;;
+    case "$cdt_disk" in
+        empty) [ "$cdt_empty_can_enable" = 1 ] ;;
+        stock) [ "$cdt_v6_can_enable" = 1 ] ;;
         *) return 1 ;;
     esac
 }
@@ -183,21 +189,58 @@ sm8850_boost_frequencies() {
     return 0
 }
 
-sm8850_cpu_frequencies() {
-    check_sm8850_policies
+sm8850_online_policies() {
+    printf '%s\n' "$1" | awk -F, '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i !~ /^[0-7](-[0-7])?$/) exit 1
+                n = split($i, range, "-")
+                first = range[1] + 0
+                last = n == 2 ? range[2] + 0 : first
+                if (first > last) exit 1
+                if (first < 6) policy0 = 1
+                if (last >= 6) policy6 = 1
+            }
+            if (policy0) print 0
+            if (policy6) print 6
+            if (!policy0 && !policy6) exit 1
+        }
+    '
+}
+
+sm8850_policy_frequencies() {
     local policy frequencies boost
-    for policy in 0 6; do
-        frequencies=$(cat "$cpu/cpufreq/policy$policy/scaling_available_frequencies") ||
+    for policy in "$@"; do
+        check_sm8850_policy "$policy"
+        frequencies=$(cat "$cpu/cpufreq/policy$policy/scaling_available_frequencies" 2>/dev/null) &&
+            [ -n "$frequencies" ] ||
             die "无法读取 policy$policy 频点表"
         boost=$(sm8850_boost_frequencies "$policy" | tr '\n' ' ')
         printf 'POLICY %s %s %s\n' "$policy" "$frequencies" "$boost"
     done
 }
 
+sm8850_cpu_frequencies() {
+    local attempt online policies frequencies failure
+    for attempt in 1 2 3; do
+        failure=
+        online=$(cat "$cpu/online") || die "无法读取在线 CPU"
+        policies=$(sm8850_online_policies "$online") || die "在线 CPU 状态无效"
+        if frequencies=$(sm8850_policy_frequencies $policies 2>&1); then
+            if [ "$online" = "$(cat "$cpu/online" 2>/dev/null)" ]; then
+                printf 'ONLINE %s\n%s\n' "$online" "$frequencies"
+                return 0
+            fi
+        else
+            failure=${frequencies##*ERROR }
+        fi
+    done
+    die "${failure:-在线 CPU 状态持续变化，无法读取一致的频点表}"
+}
+
 read_sm8850_frequencies() {
     is_sm8850 || die "需要 SM8850 平台"
     printf 'BOOT %s\n' "$(cat "$boot_file")"
-    printf 'ONLINE %s\n' "$(cat "$cpu/online")"
     if kernel_module_asset stress-qos >/dev/null; then printf 'FIXED 1\n'; else printf 'FIXED 0\n'; fi
     if kernel_module_asset qcom-scmi-ro >/dev/null; then printf 'VOLTAGE 1\n'; else printf 'VOLTAGE 0\n'; fi
     sm8850_cpu_frequencies
@@ -206,9 +249,10 @@ read_sm8850_frequencies() {
 check_firmware() {
     [ "$(id -u)" = 0 ] || die "需要 Root 权限"
     case "$action" in cdt_backup|cdt_status|cdt_recover|cdt_restore) return 0 ;; esac
-    [ -d "$cpu/cpufreq/policy0" ] &&
-        [ -d "$cpu/cpufreq/policy6" ] ||
-        die "缺少 CPU policy0/policy6 调频接口"
+    if ! is_sm8850; then
+        [ -d "$cpu/cpufreq/policy0" ] && [ -d "$cpu/cpufreq/policy6" ] ||
+            die "缺少 CPU policy0/policy6 调频接口"
+    fi
     case "$action" in
         read|cdt_enable)
             [ -d /sys/bus/scmi_protocol ] || die "缺少 /sys/bus/scmi_protocol 接口" ;;
@@ -281,6 +325,7 @@ read_cdt_status() {
     cdt_disk=unknown
     cdt_key7=absent
     cdt_platform=none
+    cdt_empty_can_enable=0
     cdt_v6_can_enable=0
     cdt_backup_status=missing
     while IFS='=' read -r k v; do
@@ -288,6 +333,7 @@ read_cdt_status() {
             CDT_DISK) cdt_disk=$v ;;
             CDT_KEY7) cdt_key7=$v ;;
             CDT_PLATFORM) cdt_platform=$v ;;
+            CDT_EMPTY_CAN_ENABLE) cdt_empty_can_enable=$v ;;
             CDT_V6_CAN_ENABLE) cdt_v6_can_enable=$v ;;
             CDT_BACKUP_STATUS) cdt_backup_status=$v ;;
             BOOT_CDT) boot_cdt=$v ;;
@@ -420,10 +466,11 @@ plan_frequencies() {
 validate_current_plan() {
     plan_frequencies "$work/current" > "$work/current.freq" || die "SCMI 电压计划校验失败"
     if is_sm8850; then
-        sm8850_cpu_frequencies > "$work/cpu.freq"
+        sm8850_cpu_frequencies > "$work/cpu.freq" ||
+            die "无法读取系统频点校验 SCMI 电压计划"
         awk '
             FNR == NR { plan[$1, $3] = 1; next }
-            {
+            $1 == "POLICY" {
                 domain = $2 == 0 ? 0 : 1
                 for (i = 3; i <= NF; i++) if (!plan[domain, $i]) exit 1
             }
@@ -443,15 +490,19 @@ emit_report() {
     printf 'BOOT %s\nSTATE %s\nCDT_DISK %s\nCDT_KEY7 %s\nCDT_HAS_BACKUP %s\nCDT_PLATFORM %s\nBOOT_CDT %s\nBOOT_PLATFORM_INFO %s\nAPNS_SLOT %s\nONLINE %s\nBASELINE_SOURCE %s\n' \
         "$boot" "$state" "$cdt_disk" "$cdt_key7" "$has_backup" "$cdt_platform" \
         "$boot_cdt" "$boot_platform_info" "$apns_slot" "$online" "$baseline_source"
+    flash_supported=1
     if is_sm8850; then
         flash_supported=0
         if sm8850_cdt_ready; then flash_supported=1; fi
-        printf 'PLAN_MODEL SM8850\nCDT_FLASH_SUPPORTED %s\n' "$flash_supported"
+        printf 'PLAN_MODEL SM8850\n'
         if [ "$(sed -n '1s/^# boot_id=//p' "$persistent/stock-baseline.csv" 2>/dev/null || true)" = "$boot" ] &&
             [ "$state" = CDT_WRITTEN ]; then
             printf 'CDT_PENDING_REBOOT 1\n'
         fi
+    elif [ "$cdt_disk" = empty ]; then
+        flash_supported=$cdt_empty_can_enable
     fi
+    printf 'CDT_FLASH_SUPPORTED %s\n' "$flash_supported"
 
     if [ "$baseline_source" = persisted ]; then
         printf 'BEGIN baseline\n'
@@ -977,7 +1028,10 @@ case "$action" in
         case "$workload" in mixed|int|fp) ;; *) die "算力测试类型无效" ;; esac
         case "$1" in [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) die "核心掩码无效" ;; esac
         [ "$1" -le 255 ] || die "核心掩码无效"
-        if is_sm8850; then check_sm8850_policies; fi
+        if is_sm8850; then
+            if [ "$(($1 & 63))" != 0 ]; then check_sm8850_policy 0; fi
+            if [ "$(($1 & 192))" != 0 ]; then check_sm8850_policy 6; fi
+        fi
         case "$4" in
             max) set_performance "$1" ;;
             fixed) lock_frequencies "$1" "$5" "$6"; set_performance "$1" ;;

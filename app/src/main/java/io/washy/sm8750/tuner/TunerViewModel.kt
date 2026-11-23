@@ -9,7 +9,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -17,9 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 internal enum class Operation {
-    READING, EXPORTING_DIAGNOSTICS, WRITING_CDT, BACKUP_CDT, REBOOTING, LOADING, GAME_TEST;
-
-    val isLoad: Boolean get() = this == LOADING || this == GAME_TEST
+    READING, EXPORTING_DIAGNOSTICS, WRITING_CDT, BACKUP_CDT, REBOOTING, LOADING,
 }
 
 internal enum class RebootPrompt { ENABLED_CDT, RESTORED_CDT }
@@ -58,8 +55,6 @@ internal data class ScreenState(
     val workload: WorkloadKind = WorkloadKind.FP,
     val fixedFrequencies: Map<Int, Int> = emptyMap(),
     val lastRun: LoadRun? = null,
-    val gameSession: GameSession? = null,
-    val gameResult: GameResult? = null,
 ) {
     val benchmarkOnline: Set<Int> get() = benchmarkDevice?.online ?: plan?.online.orEmpty()
     val benchmarkFrequencies: Map<Int, List<Int>>
@@ -90,8 +85,8 @@ internal data class CrashLogState(
 
 internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     private val backend = RootBackend(app)
-    private val isSm8850 = Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL.equals("SM8850", ignoreCase = true)
-    private val gameStore = GameResultStore(app)
+    private val isSm8850 = Build.VERSION.SDK_INT >= 31 &&
+        (Build.SOC_MODEL.equals("SM8850", ignoreCase = true) || Build.SOC_MODEL.equals("SM8850P", ignoreCase = true))
     private val crashLogStore = CrashLogStore(app)
     private val _crashLogState = MutableStateFlow(CrashLogState())
     val crashLogState = _crashLogState.asStateFlow()
@@ -101,10 +96,6 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     private var control: LoadControl? = null
 
     init {
-        viewModelScope.launch(Dispatchers.IO) {
-            val saved = gameStore.read()
-            _state.update { if (it.gameSession == null && it.gameResult == null) it.copy(gameResult = saved) else it }
-        }
         // The legacy refresh loads PJZ110-specific probe modules.
         if (isSm8850 || Build.MODEL.equals("PJZ110", ignoreCase = true)) refresh()
     }
@@ -446,84 +437,6 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
                 control = null
             }
         }
-    }
-
-    fun startGameTest() = launchOperation(Operation.GAME_TEST, "准备稳定性测试…") {
-        val session = GameSession()
-        _state.update { it.copy(gameSession = session, gameResult = GameResult(GameOutcome.RUNNING)) }
-        try {
-            val result = withContext(Dispatchers.IO) { runGameTest(session) }
-            _state.update { it.copy(gameResult = result) }
-            withContext(Dispatchers.IO) { gameStore.write(result) }
-        } finally {
-            session.stopped = true
-            _state.update {
-                val result = it.gameResult?.let { current ->
-                    if (current.outcome == GameOutcome.RUNNING) current.copy(outcome = GameOutcome.INTERRUPTED)
-                    else current
-                }
-                it.copy(gameSession = null, gameResult = result)
-            }
-        }
-    }
-
-    private suspend fun runGameTest(session: GameSession): GameResult {
-        val start = System.nanoTime()
-        gameStore.write(GameResult(GameOutcome.RUNNING))
-        var lastProgress = 0
-        val cpu = GameCpuWorkers(session)
-        try {
-            backend.startGameTrace(cpu.awaitTids()).use { trace ->
-                trace.awaitReady()
-                while (!session.stopped && session.failure.get() == null && session.lastFrameNs == 0L &&
-                    System.nanoTime() - start < 12_000_000_000L
-                ) delay(20)
-                if (!session.stopped && session.lastFrameNs == 0L) {
-                    session.failure.compareAndSet(null, "GPU 场景启动超时")
-                }
-                if (session.lastFrameNs != 0L && session.failure.get() == null && !session.stopped) {
-                    session.beginNs = System.nanoTime()
-                    while (!session.stopped && session.failure.get() == null) {
-                        val now = System.nanoTime()
-                        val elapsedMs = session.elapsedMs(now)
-                        if (now - session.lastFrameNs > 3_000_000_000L) {
-                            session.failure.compareAndSet(null, "GPU 场景连续 3 秒无新帧")
-                            break
-                        }
-                        val elapsed = (elapsedMs / 1000).toInt()
-                        if (elapsed == GAME_SECONDS) break
-                        gameBurst(elapsedMs, session.workerCount)?.let(cpu::pulse)
-                        if (elapsed > lastProgress) {
-                            lastProgress = elapsed
-                            val progress = GameResult(GameOutcome.RUNNING, elapsed, gameRounds(elapsedMs))
-                            _state.update { it.copy(gameResult = progress) }
-                            if (elapsed % 4 == 0) gameStore.write(progress)
-                        }
-                        delay(12)
-                    }
-                }
-                val end = System.nanoTime()
-                val userStopped = session.stopped
-                val elapsedMs = session.elapsedMs(end)
-                session.stopped = true
-                trace.close()
-                val coverage = if (session.beginNs != 0L) trace.coverage(session.beginNs, end, session.gpuSpans()) else null
-                val error = session.failure.get()
-                val outcome = when {
-                    error != null -> GameOutcome.FAILED
-                    userStopped -> GameOutcome.STOPPED
-                    else -> GameOutcome.COMPLETED
-                }
-                return GameResult(outcome, (elapsedMs / 1000).toInt(), gameRounds(elapsedMs), coverage, error)
-            }
-        } finally {
-            session.stopped = true
-            cpu.close()
-        }
-    }
-
-    fun stopGameTest() {
-        _state.value.gameSession?.stopped = true
     }
 
     private suspend fun runTimedLoad(

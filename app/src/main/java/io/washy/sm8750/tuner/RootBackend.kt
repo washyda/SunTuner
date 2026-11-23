@@ -128,13 +128,6 @@ internal class RootBackend(private val context: Context) {
         output.use { it.write(entry.reportText().encodeToByteArray()) }
     }
 
-    fun startGameTrace(tids: Set<Int>): GameTrace = GameTrace(tids) {
-        val args = listOf("/system/bin/sh", File(bundle, "game_trace.sh").path) + tids.map(Int::toString)
-        ProcessBuilder("su", "-c", args.joinToString(" ") { shellQuote(it) })
-            .redirectErrorStream(true)
-            .start()
-    }
-
     suspend fun collectDiagnostics(): CompatibilityReport = withContext(Dispatchers.IO) {
         val installedPackage = context.packageManager.getPackageInfo(context.packageName, 0)
         val apkSha256 = runCatching {
