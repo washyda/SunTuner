@@ -81,23 +81,33 @@ internal class RootBackend(private val context: Context) {
     private val cdtFailureLog = AtomicFile(File(context.filesDir, "cdt-last-failure.txt"))
     val hasCdtFailureLog: Boolean get() = cdtFailureLog.baseFile.isFile
     private val bundle by lazy {
-        File(context.filesDir, "backend").apply {
-            check(isDirectory || mkdirs()) { "无法准备 Root 后端" }
-            val assets = context.assets
-            val names = checkNotNull(assets.list("backend")).toSet()
-            listFiles()?.forEach { existing ->
-                if (existing.name !in names) existing.deleteRecursively()
+        File(context.filesDir, "backend").also { installAssets("backend", it) }
+    }
+
+    private fun installAssets(assetPath: String, directory: File) {
+        if (directory.isFile) check(directory.delete()) { "无法替换 Root 后端文件 $assetPath" }
+        check(directory.isDirectory || directory.mkdirs()) { "无法准备 Root 后端 $assetPath" }
+
+        val assets = context.assets
+        val names = checkNotNull(assets.list(assetPath)).toSet()
+        directory.listFiles()?.forEach { existing ->
+            if (existing.name !in names) existing.deleteRecursively()
+        }
+        for (name in names) {
+            val path = "$assetPath/$name"
+            val destination = File(directory, name)
+            if (!assets.list(path).isNullOrEmpty()) {
+                installAssets(path, destination)
+                continue
             }
-            for (name in names) {
-                val temporary = File.createTempFile("tuner-", ".tmp", this)
-                try {
-                    assets.open("backend/$name").use { input ->
-                        temporary.outputStream().use { output -> input.copyTo(output) }
-                    }
-                    check(temporary.renameTo(File(this, name))) { "无法准备后端文件 $name" }
-                } finally {
-                    temporary.delete()
+            val temporary = File.createTempFile("tuner-", ".tmp", directory)
+            try {
+                assets.open(path).use { input ->
+                    temporary.outputStream().use { output -> input.copyTo(output) }
                 }
+                check(temporary.renameTo(destination)) { "无法准备 Root 后端文件 $path" }
+            } finally {
+                temporary.delete()
             }
         }
     }
@@ -116,18 +126,6 @@ internal class RootBackend(private val context: Context) {
     suspend fun exportCrashLog(destination: Uri, entry: CrashEntry) = withContext(Dispatchers.IO) {
         val output = context.contentResolver.openOutputStream(destination, "wt") ?: error("无法打开保存位置")
         output.use { it.write(entry.reportText().encodeToByteArray()) }
-    }
-
-    suspend fun runManualSlt(bootId: String, domain: Int): ManualSltResult {
-        require(domain in 0..1)
-        val output = command(listOf("manual_slt", bootId, domain.toString()))
-        val changed = output.lineSequence().singleOrNull { it.startsWith("SLT_CHANGED ") }
-            ?.substringAfter(' ')?.toIntOrNull()
-        val plan = parsePlan(output)
-        check(changed != null && changed in 0..16 && plan.bootId == bootId && domain in plan.manualSltDomains) {
-            "手动 SLT 读回不完整，请刷新电压计划"
-        }
-        return ManualSltResult(plan, changed)
     }
 
     fun startGameTrace(tids: Set<Int>): GameTrace = GameTrace(tids) {
@@ -455,5 +453,3 @@ internal data class CdtBackupResult(
     val displayName: String?,
     val sha256: String,
 )
-
-internal data class ManualSltResult(val plan: DevicePlan, val changed: Int)

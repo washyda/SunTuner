@@ -4,3 +4,4 @@
 .*.cmd
 Module.symvers
 modules.order
+src/*.ko

@@ -17,7 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 internal enum class Operation {
-    READING, EXPORTING_DIAGNOSTICS, WRITING_CDT, BACKUP_CDT, REBOOTING, LOADING, GAME_TEST, MANUAL_SLT;
+    READING, EXPORTING_DIAGNOSTICS, WRITING_CDT, BACKUP_CDT, REBOOTING, LOADING, GAME_TEST;
 
     val isLoad: Boolean get() = this == LOADING || this == GAME_TEST
 }
@@ -60,7 +60,6 @@ internal data class ScreenState(
     val lastRun: LoadRun? = null,
     val gameSession: GameSession? = null,
     val gameResult: GameResult? = null,
-    val sltChanges: Map<Int, Int> = emptyMap(),
 ) {
     val benchmarkOnline: Set<Int> get() = benchmarkDevice?.online ?: plan?.online.orEmpty()
     val benchmarkFrequencies: Map<Int, List<Int>>
@@ -276,18 +275,6 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     fun checkCompatibility() = launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在检测兼容性…") {
         val report = backend.collectDiagnostics()
         _state.update { it.copy(compatibilityReport = report, diagnosticsSaved = false) }
-    }
-
-    fun startManualSlt(domain: Int) {
-        val snapshot = _state.value
-        val device = snapshot.plan ?: return
-        if (!device.manualSltSupported || snapshot.cdtUncertain || domain !in 0..1) return
-        launchOperation(Operation.MANUAL_SLT, "正在对 PDP$domain 执行一次 SLT…") {
-            _state.update { it.copy(sltChanges = it.sltChanges - domain) }
-            val result = backend.runManualSlt(device.bootId, domain)
-            updatePlan(result.plan)
-            _state.update { it.copy(sltChanges = it.sltChanges + (domain to result.changed)) }
-        }
     }
 
     fun exportDiagnostics(destination: Uri) {
@@ -578,7 +565,6 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
             plan = plan,
             cores = cores.ifEmpty { setOfNotNull(plan.online.firstOrNull()) },
             lastRun = it.lastRun.takeIf { run -> sameBoot && run?.plan == plan.current },
-            sltChanges = if (sameBoot) it.sltChanges else emptyMap(),
         )
     }
 

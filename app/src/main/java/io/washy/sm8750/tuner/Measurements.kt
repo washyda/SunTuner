@@ -46,8 +46,6 @@ internal data class DevicePlan(
     val online: Set<Int>,
     val baseline: List<Level>?,
     val current: List<Level>,
-    val manualSltSupported: Boolean = false,
-    val manualSltDomains: Set<Int> = emptySet(),
     val sm8850: Boolean = false,
     val cdtFlashSupported: Boolean = true,
     val cdtPendingReboot: Boolean = false,
@@ -362,9 +360,6 @@ internal fun parsePlan(output: String): DevicePlan {
         online = online,
         baseline = baseline,
         current = current,
-        manualSltSupported = optionalField("SLT_SUPPORTED") == "1",
-        manualSltDomains = optionalField("SLT_DOMAINS")?.split(',')
-            .orEmpty().mapNotNull(String::toIntOrNull).toSet(),
         sm8850 = sm8850,
         cdtFlashSupported = !sm8850 || optionalField("CDT_FLASH_SUPPORTED") == "1",
         cdtPendingReboot = optionalField("CDT_PENDING_REBOOT") == "1",

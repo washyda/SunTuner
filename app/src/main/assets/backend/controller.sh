@@ -16,7 +16,6 @@ work=
 pvc_pid=
 owned_plan=
 owned_observer=0
-owned_trigger=0
 
 die() { printf 'ERROR %s\n' "$*" >&2; exit 1; }
 
@@ -94,7 +93,7 @@ lock_frequencies() {
     [ ! -d "$modules/sm8750_stress_qos" ] || die "已有其他任务正在使用锁频模块"
     : > "$session/stress-qos"
     local asset
-    asset=$(stress_qos_asset) || die "当前内核缺少匹配的锁频模块"
+    asset=$(kernel_module_asset stress-qos) || die "当前内核缺少匹配的锁频模块"
     cp "$bundle/$asset" "$work/sm8750_stress_qos.ko"
     load_owned sm8750_stress_qos "pdp0_khz=$freq0" "pdp1_khz=$freq1"
 }
@@ -113,12 +112,9 @@ cleanup() {
     restore_governors || { printf 'ERROR 调速器恢复失败，刷新时会重新尝试\n' >&2; rc=1; }
     restore_frequency_lock || { printf 'ERROR 临时频率上限清理失败，刷新时会重新尝试\n' >&2; rc=1; }
     unload_scmi_module || { printf 'ERROR SCMI 读表模块卸载失败\n' >&2; rc=1; }
-    for entry in "sm8750_apns_trigger:$owned_trigger" "sm8750_acd_observer:$owned_observer"; do
-        name=${entry%:*}
-        if [ "${entry#*:}" = 1 ] && [ -d "$modules/$name" ]; then
-            rmmod "$name" || { printf 'ERROR 模块卸载失败 %s\n' "$name" >&2; rc=1; }
-        fi
-    done
+    if [ "$owned_observer" = 1 ] && [ -d "$modules/sm8750_acd_observer" ]; then
+        rmmod sm8750_acd_observer || { printf 'ERROR ACD 状态探针卸载失败\n' >&2; rc=1; }
+    fi
     [ -z "$work" ] || rm -rf -- "$work" || rc=1
     exit "$rc"
 }
@@ -150,26 +146,21 @@ kernel_page_size() {
     esac
 }
 
-sm8850_module_asset() {
-    local name=$1 variant= release pages
-    release=$(uname -r)
-    case "$release" in
-        6.12.*-android16-5-*)
-            pages=$(kernel_page_size) || return 1
-            [ "$pages" = 4096 ] || return 1
-            variant=-gki5-4k
-            ;;
-    esac
-    [ -r "$bundle/$name$variant.ko" ] || return 1
-    printf '%s\n' "$name$variant.ko"
-}
-
-stress_qos_asset() {
+kernel_module_asset() {
+    local name=$1 directory=sm8750 pages
     if is_sm8850; then
-        sm8850_module_asset sm8850_stress_qos
-    else
-        printf '%s\n' sm8750_stress_qos.ko
+        directory=sm8850/android16-6-4k
+        case "$(uname -r)" in
+            6.12.*-android16-5-*)
+                pages=$(kernel_page_size) || return 1
+                [ "$pages" = 4096 ] || return 1
+                directory=sm8850/android16-5-4k
+                ;;
+        esac
     fi
+    local asset="modules/$directory/$name.ko"
+    [ -r "$bundle/$asset" ] || return 1
+    printf '%s\n' "$asset"
 }
 
 sm8850_cdt_ready() {
@@ -207,8 +198,8 @@ read_sm8850_frequencies() {
     is_sm8850 || die "需要 SM8850 平台"
     printf 'BOOT %s\n' "$(cat "$boot_file")"
     printf 'ONLINE %s\n' "$(cat "$cpu/online")"
-    if stress_qos_asset >/dev/null; then printf 'FIXED 1\n'; else printf 'FIXED 0\n'; fi
-    if sm8850_module_asset qcom-scmi-ro-sm8850 >/dev/null; then printf 'VOLTAGE 1\n'; else printf 'VOLTAGE 0\n'; fi
+    if kernel_module_asset stress-qos >/dev/null; then printf 'FIXED 1\n'; else printf 'FIXED 0\n'; fi
+    if kernel_module_asset qcom-scmi-ro >/dev/null; then printf 'VOLTAGE 1\n'; else printf 'VOLTAGE 0\n'; fi
     sm8850_cpu_frequencies
 }
 
@@ -219,7 +210,7 @@ check_firmware() {
         [ -d "$cpu/cpufreq/policy6" ] ||
         die "缺少 CPU policy0/policy6 调频接口"
     case "$action" in
-        read|cdt_enable|manual_slt)
+        read|cdt_enable)
             [ -d /sys/bus/scmi_protocol ] || die "缺少 /sys/bus/scmi_protocol 接口" ;;
     esac
 }
@@ -254,9 +245,9 @@ prepare_cdt_tool() {
 
 probe_apns_slot() {
     apns_slot=unknown
-    [ -r "$bundle/sm8750_acd_observer.ko" ] || return 0
+    [ -r "$bundle/modules/sm8750/acd-observer.ko" ] || return 0
     [ ! -d "$modules/sm8750_acd_observer" ] || return 0
-    cp "$bundle/sm8750_acd_observer.ko" "$work/sm8750_acd_observer.ko"
+    cp "$bundle/modules/sm8750/acd-observer.ko" "$work/sm8750_acd_observer.ko"
     apns_slot=stock
     for domain in 0 1; do
         if insmod "$work/sm8750_acd_observer.ko" "pdp=$domain" 2>/dev/null; then
@@ -323,6 +314,7 @@ classify_state() {
 }
 
 stock_baseline_candidate() {
+    # An older app build may have recalibrated this running boot.
     case "$cdt_disk" in empty|stock) ;; *) return 1 ;; esac
     [ "$apns_slot" != external ] &&
         [ ! -e "$session/manual-slt-0" ] && [ ! -e "$session/manual-slt-1" ] &&
@@ -369,11 +361,8 @@ unload_scmi_module() {
 }
 
 load_scmi_module() {
-    local asset=qcom-scmi-ro-sm8750.ko
-    if is_sm8850; then
-        asset=$(sm8850_module_asset qcom-scmi-ro-sm8850) || die "缺少对应内核的 SM8850 电压读表模块"
-    fi
-    [ -r "$bundle/$asset" ] || die "缺少 $asset"
+    local asset
+    asset=$(kernel_module_asset qcom-scmi-ro) || die "缺少对应内核的 SCMI 电压读表模块"
     scmi_module_busy && die "SCMI 读表模块正在被其他程序使用"
     insmod_scmi_asset "$asset" || die "加载 qcom-scmi-ro 失败（当前内核 $(uname -r)）"
 }
@@ -385,69 +374,6 @@ report() {
         validate_current_plan
     fi
     maybe_persist_stock_baseline "$work/current"
-    prepare_report
-    emit_report
-}
-
-manual_slt_supported() {
-    [ "$(getprop ro.product.model)" = PJZ110 ] &&
-        [ "$(getprop ro.soc.model)" = SM8750 ] &&
-        [ "$(uname -r)" = 6.6.118-android15-8-g9bc34d5b0c79-abogki537459655-4k ] &&
-        [ "$(getprop ro.build.fingerprint)" = OnePlus/PJZ110/OP5D0DL1:17/CP2A.260605.016/V.487427a-2227f32-224bc4c:user/release-keys ]
-}
-
-manual_slt() {
-    local target="$1" slot mask marker changed
-    case "$target" in 0) mask=40 ;; 1) mask=01 ;; *) die "无效的 SLT 簇" ;; esac
-    manual_slt_supported || die "当前机型、内核或固件不支持手动 SLT"
-    slot=$(getprop ro.boot.slot_suffix)
-    case "$slot" in _a|_b) ;; *) die "无法确认当前启动槽" ;; esac
-    printf '%s  %s\n' \
-        131bc2ee0f65db270f27fafa6f44d4446a5227a2a3926863ae4d511218efdc3d "/dev/block/by-name/pdp$slot" \
-        4b3d944d9a5304c4817eb06bd901d62b4a833c8b5fd56395f706a93ee9630ca2 "/dev/block/by-name/uefi$slot" |
-        sha256sum -c - >/dev/null || die "当前 PDP 或 UEFI 与已验证的手动 SLT 版本不匹配"
-    [ "$(cat "$cpu/online")" = 0-7 ] || die "手动 SLT 需要八核在线"
-    [ "$(cat "$cpu/cpufreq/policy0/related_cpus")" = "0 1 2 3 4 5" ] &&
-        [ "$(cat "$cpu/cpufreq/policy6/related_cpus")" = "6 7" ] || die "CPU 拓扑与已验证配置不匹配"
-    [ ! -e "$persistent/cdt-orig.bin.transaction" ] || die "请先刷新并处理 CDT 恢复记录"
-    [ ! -d "$modules/sm8750_apns_trigger" ] || die "SLT 模块正在被其他任务使用"
-    prepare_cdt_tool
-    inspect_state
-    case "$state" in CDT_RECOVERY_REQUIRED|CORRUPT_CDT) die "请先检查 CDT 状态" ;; esac
-    load_scmi_module
-    load_owned sm8750_acd_observer "pdp=$target"
-    owned_observer=1
-    stock_slot "$(cat "$modules/sm8750_acd_observer/parameters/snapshot")" ||
-        die "PDP$target 当前完成槽状态无法确认"
-    rmmod sm8750_acd_observer || die "无法卸载 SLT 状态探针"
-    owned_observer=0
-    cp "$bundle/sm8750_apns_trigger.ko" "$work/" || die "缺少 SLT 触发模块"
-    plan > "$work/before" && plan_frequencies "$work/before" > "$work/before.freq" ||
-        die "SLT 前电压计划读回失败"
-    maybe_persist_stock_baseline "$work/before"
-
-    # A failed reply can follow a sent request. Keep this boot's stock baseline protected.
-    marker="$session/manual-slt-$target"
-    if [ ! -e "$marker" ]; then
-        printf 'attempted\n' > "$marker" || die "无法保存 SLT 状态"
-    fi
-    owned_trigger=1
-    taskset "$mask" insmod "$work/sm8750_apns_trigger.ko" "pdp=$target" action=1 ||
-        die "PDP$target SLT 未获固件确认，请刷新电压计划"
-    printf 'accepted\n' > "$marker" || die "SLT 已获固件确认，状态保存失败，请刷新电压计划"
-    rmmod sm8750_apns_trigger || die "SLT 已获固件确认，触发模块卸载失败"
-    owned_trigger=0
-
-    sleep 0.5
-    plan > "$work/current" && plan_frequencies "$work/current" > "$work/current.freq" &&
-        cmp -s "$work/before.freq" "$work/current.freq" ||
-        die "SLT 已获固件确认，电压计划读回失败，请刷新"
-    changed=$(awk -F, -v target="$target" '
-        FNR == NR { if ($1 == target) power[$2] = $4; next }
-        $1 == target && power[$2] != $4 { changed++ }
-        END { print changed + 0 }
-    ' "$work/before" "$work/current")
-    printf 'SLT_CHANGED %s\n' "$changed"
     prepare_report
     emit_report
 }
@@ -506,13 +432,6 @@ validate_current_plan() {
 }
 
 emit_report() {
-    local slt_supported=0 slt_domains=none domain
-    if manual_slt_supported; then slt_supported=1; fi
-    for domain in 0 1; do
-        if [ "$(cat "$session/manual-slt-$domain" 2>/dev/null || true)" = accepted ]; then
-            if [ "$slt_domains" = none ]; then slt_domains=$domain; else slt_domains="$slt_domains,$domain"; fi
-        fi
-    done
     if stock_baseline_candidate && [ "$boot_cdt" = not_found ]; then
         baseline_source=current_stock
     elif [ -f "$work/baseline" ]; then
@@ -524,7 +443,6 @@ emit_report() {
     printf 'BOOT %s\nSTATE %s\nCDT_DISK %s\nCDT_KEY7 %s\nCDT_HAS_BACKUP %s\nCDT_PLATFORM %s\nBOOT_CDT %s\nBOOT_PLATFORM_INFO %s\nAPNS_SLOT %s\nONLINE %s\nBASELINE_SOURCE %s\n' \
         "$boot" "$state" "$cdt_disk" "$cdt_key7" "$has_backup" "$cdt_platform" \
         "$boot_cdt" "$boot_platform_info" "$apns_slot" "$online" "$baseline_source"
-    printf 'SLT_SUPPORTED %s\nSLT_DOMAINS %s\n' "$slt_supported" "$slt_domains"
     if is_sm8850; then
         flash_supported=0
         if sm8850_cdt_ready; then flash_supported=1; fi
@@ -791,7 +709,7 @@ scmi_module_kernel_log() {
 
 read_sm8850_perf() {
     local asset
-    if ! asset=$(sm8850_module_asset qcom-scmi-ro-sm8850); then
+    if ! asset=$(kernel_module_asset qcom-scmi-ro); then
         printf 'SCMI_PERF=module_missing\n'
         return 1
     fi
@@ -1048,9 +966,6 @@ case "$action" in
 esac
 
 case "$action" in
-    manual_slt)
-        [ "$#" = 2 ] && [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新"
-        manual_slt "$2" ;;
     reboot)
         [ "$#" = 1 ] && [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新"
         /system/bin/svc power reboot --no-wait ;;
@@ -1077,10 +992,10 @@ case "$action" in
         cp "$bundle/load" "$work/load"
         chmod 700 "$work/load"
         : > "$work/pvc.out"
-        if ! is_sm8850 && [ "$3" -ge 6 ] && [ -r "$bundle/sm8750_pvc_corr_ro.ko" ]; then
+        if ! is_sm8850 && [ "$3" -ge 6 ] && [ -r "$bundle/modules/sm8750/pvc-corr-ro.ko" ]; then
             prev_t0=$(prev_pvc_t0_ns)
             run_pvc_sampler "$work/pvc.ready" "$work/load.done" "$prev_t0" "$work/pvc.out" \
-                "$bundle/sm8750_pvc_corr_ro.ko" "$work/sm8750_pvc_corr_ro.ko" &
+                "$bundle/modules/sm8750/pvc-corr-ro.ko" "$work/sm8750_pvc_corr_ro.ko" &
             pvc_pid=$!
         else
             printf 'PVC_STATUS skipped\n' > "$work/pvc.out"

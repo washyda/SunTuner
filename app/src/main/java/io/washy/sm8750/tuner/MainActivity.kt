@@ -78,7 +78,7 @@ class MainActivity : ComponentActivity() {
             }
             LaunchedEffect(state.operation) {
                 if (state.operation?.isLoad == true ||
-                    state.operation == Operation.WRITING_CDT || state.operation == Operation.MANUAL_SLT
+                    state.operation == Operation.WRITING_CDT
                 ) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 } else {
@@ -106,7 +106,6 @@ class MainActivity : ComponentActivity() {
                     },
                     onDismissCdtBackupResult = model::dismissCdtBackupResult,
                     onEnableCdt = model::enableCdt,
-                    onManualSlt = model::startManualSlt,
                     onRestoreCdt = { model.restoreCdt(fallbackClean = false) },
                     onRestoreCdtFromFile = { cdtRestorePicker.launch(arrayOf("*/*")) },
                     onRestoreFallbackClean = { model.restoreCdt(fallbackClean = true) },
@@ -155,7 +154,6 @@ private fun TunerApp(
     onBackupCdt: () -> Unit,
     onDismissCdtBackupResult: () -> Unit,
     onEnableCdt: () -> Unit,
-    onManualSlt: (Int) -> Unit,
     onRestoreCdt: () -> Unit,
     onRestoreCdtFromFile: () -> Unit,
     onRestoreFallbackClean: () -> Unit,
@@ -327,7 +325,6 @@ private fun TunerApp(
                         onCheckCompatibility = onCheckCompatibility,
                         onBackupCdt = onBackupCdt,
                         onEnableCdt = onEnableCdt,
-                        onManualSlt = onManualSlt,
                         onRestoreCdt = onRestoreCdt,
                         onRestoreCdtFromFile = onRestoreCdtFromFile,
                         onRebootNow = onRebootNow,
@@ -432,7 +429,6 @@ private fun TunerPreview() {
             onExportCdtFailureLog = {}, onDismissCdtLogExportResult = {},
             onBackupCdt = {}, onDismissCdtBackupResult = {},
             onEnableCdt = {}, onRestoreCdt = {}, onRestoreCdtFromFile = {}, onRestoreFallbackClean = {},
-            onManualSlt = {},
             onDismissRestoreNoBackup = {}, onRebootNow = {}, onDismissReboot = {},
             onPreset = {}, onCore = {}, onThreads = {}, onSeconds = {}, onQuickSeconds = {},
             onMode = {}, onWorkload = {}, onFrequency = { _, _ -> }, onStart = {}, onStop = {},

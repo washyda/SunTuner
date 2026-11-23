@@ -59,7 +59,6 @@ internal fun VoltageScreen(
     onCheckCompatibility: () -> Unit,
     onBackupCdt: () -> Unit,
     onEnableCdt: () -> Unit,
-    onManualSlt: (Int) -> Unit,
     onRestoreCdt: () -> Unit,
     onRestoreCdtFromFile: () -> Unit,
     onRebootNow: () -> Unit,
@@ -164,13 +163,10 @@ internal fun VoltageScreen(
 
         val comparisonBaseline = device?.takeIf {
             it.baselineSource == BaselineSource.PERSISTED &&
-                (it.state == PlanState.CDT_WRITTEN || it.state == PlanState.EXTERNAL_RUNTIME ||
-                    it.manualSltDomains.isNotEmpty())
+                (it.state == PlanState.CDT_WRITTEN || it.state == PlanState.EXTERNAL_RUNTIME)
         }?.baseline
 
         val visibleDomains = if (clusterFilter in 0..1) listOf(clusterFilter) else listOf(0, 1)
-        val canRunSlt = state.operation == null && !state.cdtUncertain && (0..7).all { it in device?.online.orEmpty() } &&
-            cdtState != PlanState.CDT_RECOVERY_REQUIRED && cdtState != PlanState.CORRUPT_CDT
         for (domain in visibleDomains) {
             item(key = "cluster_card_$domain") {
                 ClusterVoltageCard(
@@ -178,18 +174,6 @@ internal fun VoltageScreen(
                     currentLevels = currentLevels.filter { it.domain == domain },
                     baselineLevels = comparisonBaseline?.filter { it.domain == domain }
                         ?.takeIf { levels -> levels.any { it.millivolts != null } },
-                    sltAction = if (device?.manualSltSupported == true) {
-                        {
-                            OutlinedButton(onClick = { onManualSlt(domain) }, enabled = canRunSlt) {
-                                Text("手动 SLT")
-                            }
-                        }
-                    } else null,
-                    sltStatus = when (val changed = state.sltChanges[domain]) {
-                        null -> if (domain in device?.manualSltDomains.orEmpty()) "本次启动已手动 SLT" else null
-                        0 -> "SLT 已应答 · 电压计划无变化"
-                        else -> "SLT 已应答 · $changed / 16 档变化"
-                    },
                 )
             }
         }
@@ -330,7 +314,6 @@ private fun VoltageScreenPreview() {
             state = ScreenState(),
             onRefresh = {}, onCheckCompatibility = {}, onBackupCdt = {}, onEnableCdt = {}, onRestoreCdt = {},
             onRestoreCdtFromFile = {}, onRebootNow = {},
-            onManualSlt = {},
         )
     }
 }
@@ -340,8 +323,6 @@ private fun ClusterVoltageCard(
     domain: Int,
     currentLevels: List<Level>,
     baselineLevels: List<Level>?,
-    sltAction: (@Composable () -> Unit)?,
-    sltStatus: String?,
 ) {
     val showComparison = baselineLevels != null
     val maxMv = (currentLevels.mapNotNull { it.millivolts } + baselineLevels.orEmpty().mapNotNull { it.millivolts })
@@ -350,21 +331,13 @@ private fun ClusterVoltageCard(
 
     Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(title, style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold))
-                    if (currentLevels.isNotEmpty()) {
-                        Text(
-                            "${decimal(currentLevels.first().khz / 1000.0, 0)}–${decimal(currentLevels.last().khz / 1000.0, 0)} MHz",
-                            style = MaterialTheme.typography.labelSmall.tabular(),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                sltAction?.invoke()
-            }
-            if (sltStatus != null) {
-                Text(sltStatus, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(title, style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold))
+            if (currentLevels.isNotEmpty()) {
+                Text(
+                    "${decimal(currentLevels.first().khz / 1000.0, 0)}–${decimal(currentLevels.last().khz / 1000.0, 0)} MHz",
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text("频点", Modifier.weight(1.25f), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

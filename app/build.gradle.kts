@@ -14,7 +14,7 @@ android {
         applicationId = "io.washy.sm8750.tuner"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("11").get().toInt()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("12").get().toInt()
         versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.7beta").get()
     }
 
@@ -46,22 +46,25 @@ val ndk = providers.environmentVariable("ANDROID_NDK_HOME").orElse(
     },
 )
 val generatedAssets = layout.buildDirectory.dir("generated/tuner-assets")
+val kernelPrebuilts = rootProject.file("kernel/prebuilt")
 val backendModules = listOf(
-    "kernel/sm8750_acd_observer.ko",
-    "kernel/sm8750_apns_trigger.ko",
-    "kernel/qcom-scmi-ro-sm8750.ko",
-    "kernel/sm8750_pvc_corr_ro.ko",
-    "kernel/sm8750_stress_qos.ko",
-    "kernel/sm8850_stress_qos.ko",
-    "kernel/qcom-scmi-ro-sm8850.ko",
-    "kernel/qcom-scmi-ro-sm8850-gki5-4k.ko",
-    "kernel/sm8850_stress_qos-gki5-4k.ko",
-).map(rootProject::file)
+    "sm8750/acd-observer.ko",
+    "sm8750/pvc-corr-ro.ko",
+    "sm8750/qcom-scmi-ro.ko",
+    "sm8750/stress-qos.ko",
+    "sm8850/android16-5-4k/qcom-scmi-ro.ko",
+    "sm8850/android16-5-4k/stress-qos.ko",
+    "sm8850/android16-6-4k/qcom-scmi-ro.ko",
+    "sm8850/android16-6-4k/stress-qos.ko",
+)
 val generateBackend by tasks.registering(Sync::class) {
-    from(backendModules)
-    into(generatedAssets.map { it.dir("backend") })
+    from(kernelPrebuilts) { include(backendModules) }
+    into(generatedAssets.map { it.dir("backend/modules") })
     doFirst {
-        backendModules.forEach { check(it.isFile) { "Missing kernel module: $it" } }
+        backendModules.forEach { path ->
+            val module = kernelPrebuilts.resolve(path)
+            check(module.isFile) { "Missing kernel module: $module" }
+        }
     }
 }
 val generatedNativeAssets = layout.buildDirectory.dir("generated/tuner-native-assets")
