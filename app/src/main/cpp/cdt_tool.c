@@ -25,6 +25,8 @@ enum {
     CDT_MAX_PART_SIZE = 1048576,
     CDT_MAX_BLOCKS = 16,
     CDT_SLT_KEY = 7,
+    CDT_PLATFORM_MTP = 8,
+    CDT_PLATFORM_QRD = 11,
 };
 
 typedef struct {
@@ -494,6 +496,19 @@ static void trim_ws(char *s) {
     while (len > 0 && isspace((unsigned char)s[len - 1])) s[--len] = '\0';
 }
 
+static int read_platform_value(const char *path, unsigned long valid_bits, unsigned long *value) {
+    char buf[64];
+    if (read_small_text(path, buf, sizeof(buf)) != 0) return 0;
+    trim_ws(buf);
+    if (!isdigit((unsigned char)buf[0])) return 0;
+    errno = 0;
+    char *end;
+    unsigned long parsed = strtoul(buf, &end, 0);
+    if (errno || *end != '\0' || (parsed & ~valid_bits) != 0) return 0;
+    *value = parsed;
+    return 1;
+}
+
 static uint8_t default_cdt_version(void) {
 #ifdef __ANDROID__
     char soc[PROP_VALUE_MAX];
@@ -509,7 +524,7 @@ static int resolve_empty_cdt_hint(platform_hint_t *hint) {
     uint8_t default_version = default_cdt_version();
     if (hint->state == PLATFORM_UNKNOWN && default_version) {
         *hint = (platform_hint_t){
-            .state = PLATFORM_IDENTIFIED, .ver = default_version, .platform_id = 8, .major = 1,
+            .state = PLATFORM_IDENTIFIED, .ver = default_version, .platform_id = CDT_PLATFORM_MTP, .major = 1,
         };
     }
     return hint->state == PLATFORM_IDENTIFIED && hint->ver >= 4 &&
@@ -560,26 +575,30 @@ static const char *detect_boot_cdt_state(platform_hint_t *hint) {
     }
 
     if (hint->state == PLATFORM_UNKNOWN) {
-        char hw[64] = {0}, pver[64] = {0}, sub[64] = {0};
+        char hw[64] = {0};
         if (read_small_text("/sys/devices/soc0/hw_platform", hw, sizeof(hw)) == 0) trim_ws(hw);
         int hw_unknown = hw[0] == '\0' || strcasecmp(hw, "Unknown") == 0;
-        if (strcasecmp(hw, "MTP") == 0 || (hw_unknown && saw_mtp)) {
+        uint8_t platform_id = 0;
+        if (strcasecmp(hw, "MTP") == 0 || (hw_unknown && saw_mtp)) platform_id = CDT_PLATFORM_MTP;
+        if (strcasecmp(hw, "QRD") == 0) platform_id = CDT_PLATFORM_QRD;
+        if (platform_id) {
             unsigned long ver_num = 0x10000UL;
             unsigned long sub_num = 0UL;
-            if (read_small_text("/sys/devices/soc0/platform_version", pver, sizeof(pver)) == 0) {
-                ver_num = strtoul(pver, NULL, 0);
+            int has_version = read_platform_value("/sys/devices/soc0/platform_version", 0x00ff00ffUL, &ver_num);
+            int has_subtype = read_platform_value("/sys/devices/soc0/platform_subtype_id", UINT8_MAX, &sub_num);
+            uint8_t version = default_cdt_version();
+            if (platform_id == CDT_PLATFORM_QRD && (!version || !has_version || !has_subtype)) {
+                hint->state = PLATFORM_NO_DEFAULT;
+            } else {
+                *hint = (platform_hint_t){
+                    .state = PLATFORM_IDENTIFIED,
+                    .ver = version ? version : 5,
+                    .platform_id = platform_id,
+                    .major = (uint8_t)(ver_num >> 16),
+                    .minor = (uint8_t)ver_num,
+                    .subtype = (uint8_t)sub_num,
+                };
             }
-            if (read_small_text("/sys/devices/soc0/platform_subtype_id", sub, sizeof(sub)) == 0) {
-                sub_num = strtoul(sub, NULL, 0);
-            }
-            hint->state = PLATFORM_IDENTIFIED;
-            hint->ver = default_cdt_version();
-            if (!hint->ver) hint->ver = 5;
-            hint->platform_id = 8; /* MTP verified in XBL FALLBACK_RECORD 0x148D28B0 */
-            hint->major = (uint8_t)((ver_num >> 16) & 0xffu);
-            hint->minor = (uint8_t)(ver_num & 0xffu);
-            hint->subtype = (uint8_t)(sub_num & 0xffu);
-            hint->fusion = 0;
         } else if (!hw_unknown) {
             hint->state = PLATFORM_NO_DEFAULT;
         }
