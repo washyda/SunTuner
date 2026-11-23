@@ -205,12 +205,12 @@ static const struct scmi_device_id plan_id_table[] = {
 MODULE_DEVICE_TABLE(scmi, plan_id_table);
 
 static struct scmi_driver plan_driver = {
-	.name = "sm8750-scmi-plan-ro",
+	.name = "qcom-scmi-ro",
 	.probe = plan_probe,
 	.id_table = plan_id_table,
 	.driver = { .dev_groups = plan_groups },
 };
 module_scmi_driver(plan_driver);
 
-MODULE_DESCRIPTION("SM8750 native SCMI PERF read-only plan query draft");
+MODULE_DESCRIPTION("Qualcomm SCMI PERF read-only voltage plan query");
 MODULE_LICENSE("GPL");

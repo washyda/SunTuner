@@ -14,8 +14,8 @@ android {
         applicationId = "io.washy.sm8750.tuner"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("10").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.6beta").get()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("11").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.7beta").get()
     }
 
     buildTypes {
@@ -49,11 +49,13 @@ val generatedAssets = layout.buildDirectory.dir("generated/tuner-assets")
 val backendModules = listOf(
     "kernel/sm8750_acd_observer.ko",
     "kernel/sm8750_apns_trigger.ko",
-    "kernel/sm8750_scmi_plan_ro.ko",
+    "kernel/qcom-scmi-ro-sm8750.ko",
     "kernel/sm8750_pvc_corr_ro.ko",
     "kernel/sm8750_stress_qos.ko",
     "kernel/sm8850_stress_qos.ko",
-    "kernel/sm8850_scmi_plan_ro.ko",
+    "kernel/qcom-scmi-ro-sm8850.ko",
+    "kernel/qcom-scmi-ro-sm8850-gki5-4k.ko",
+    "kernel/sm8850_stress_qos-gki5-4k.ko",
 ).map(rootProject::file)
 val generateBackend by tasks.registering(Sync::class) {
     from(backendModules)

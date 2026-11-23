@@ -14,7 +14,7 @@ modules=/sys/module
 boot_file=/proc/sys/kernel/random/boot_id
 work=
 pvc_pid=
-owned_plan=0
+owned_plan=
 owned_observer=0
 owned_trigger=0
 
@@ -112,7 +112,8 @@ cleanup() {
     fi
     restore_governors || { printf 'ERROR 调速器恢复失败，刷新时会重新尝试\n' >&2; rc=1; }
     restore_frequency_lock || { printf 'ERROR 临时频率上限清理失败，刷新时会重新尝试\n' >&2; rc=1; }
-    for entry in "sm8750_apns_trigger:$owned_trigger" "sm8750_acd_observer:$owned_observer" "sm8750_scmi_plan_ro:$owned_plan"; do
+    unload_scmi_module || { printf 'ERROR SCMI 读表模块卸载失败\n' >&2; rc=1; }
+    for entry in "sm8750_apns_trigger:$owned_trigger" "sm8750_acd_observer:$owned_observer"; do
         name=${entry%:*}
         if [ "${entry#*:}" = 1 ] && [ -d "$modules/$name" ]; then
             rmmod "$name" || { printf 'ERROR 模块卸载失败 %s\n' "$name" >&2; rc=1; }
@@ -135,17 +136,40 @@ check_sm8850_policies() {
         die "当前 SM8850 的 CPU 簇布局与 6+2 适配不匹配"
 }
 
+kernel_page_size() {
+    local bytes
+    bytes=$(getconf PAGESIZE 2>/dev/null) || bytes=
+    case "$bytes" in
+        ''|*[!0-9]*)
+            awk '
+                /^KernelPageSize:/ && $2 > 0 { print $2 * 1024; found = 1; exit }
+                END { if (!found) exit 1 }
+            ' /proc/self/smaps
+            ;;
+        *) printf '%s\n' "$bytes" ;;
+    esac
+}
+
+sm8850_module_asset() {
+    local name=$1 variant= release pages
+    release=$(uname -r)
+    case "$release" in
+        6.12.*-android16-5-*)
+            pages=$(kernel_page_size) || return 1
+            [ "$pages" = 4096 ] || return 1
+            variant=-gki5-4k
+            ;;
+    esac
+    [ -r "$bundle/$name$variant.ko" ] || return 1
+    printf '%s\n' "$name$variant.ko"
+}
+
 stress_qos_asset() {
     if is_sm8850; then
-        [ -r "$bundle/sm8850_stress_qos.ko" ] || return 1
-        printf '%s\n' sm8850_stress_qos.ko
+        sm8850_module_asset sm8850_stress_qos
     else
         printf '%s\n' sm8750_stress_qos.ko
     fi
-}
-
-sm8850_plan_asset_present() {
-    [ -r "$bundle/sm8850_scmi_plan_ro.ko" ]
 }
 
 sm8850_cdt_ready() {
@@ -184,7 +208,7 @@ read_sm8850_frequencies() {
     printf 'BOOT %s\n' "$(cat "$boot_file")"
     printf 'ONLINE %s\n' "$(cat "$cpu/online")"
     if stress_qos_asset >/dev/null; then printf 'FIXED 1\n'; else printf 'FIXED 0\n'; fi
-    if sm8850_plan_asset_present; then printf 'VOLTAGE 1\n'; else printf 'VOLTAGE 0\n'; fi
+    if sm8850_module_asset qcom-scmi-ro-sm8850 >/dev/null; then printf 'VOLTAGE 1\n'; else printf 'VOLTAGE 0\n'; fi
     sm8850_cpu_frequencies
 }
 
@@ -208,7 +232,9 @@ load_owned() {
 }
 
 plan() {
-    set -- /sys/bus/scmi_protocol/drivers/sm8750-scmi-plan-ro/*/snapshot
+    local driver=qcom-scmi-ro
+    if [ "$owned_plan" = sm8750_scmi_plan_ro ]; then driver=sm8750-scmi-plan-ro; fi
+    set -- /sys/bus/scmi_protocol/drivers/"$driver"/*/snapshot
     [ "$#" = 1 ] && [ -r "$1" ] || die "SCMI PERF 读表模块未绑定"
     cat "$1"
 }
@@ -321,16 +347,35 @@ maybe_persist_stock_baseline() {
     printf 'WARN 无法保存刷入前的电压计划\n' >&2
 }
 
+scmi_module_busy() {
+    [ -d "$modules/qcom_scmi_ro" ] || [ -d "$modules/sm8750_scmi_plan_ro" ]
+}
+
+insmod_scmi_asset() {
+    cp "$bundle/$1" "$work/qcom-scmi-ro.ko" && insmod "$work/qcom-scmi-ro.ko" || return 1
+    if [ -d "$modules/qcom_scmi_ro" ]; then
+        owned_plan=qcom_scmi_ro
+    elif [ -d "$modules/sm8750_scmi_plan_ro" ]; then
+        owned_plan=sm8750_scmi_plan_ro
+    else
+        return 1
+    fi
+}
+
+unload_scmi_module() {
+    [ -n "$owned_plan" ] || return 0
+    if [ -d "$modules/$owned_plan" ]; then rmmod "$owned_plan" || return 1; fi
+    owned_plan=
+}
+
 load_scmi_module() {
-    local asset=sm8750_scmi_plan_ro.ko
+    local asset=qcom-scmi-ro-sm8750.ko
     if is_sm8850; then
-        sm8850_plan_asset_present || die "缺少 SM8850 电压读表模块"
-        asset=sm8850_scmi_plan_ro.ko
+        asset=$(sm8850_module_asset qcom-scmi-ro-sm8850) || die "缺少对应内核的 SM8850 电压读表模块"
     fi
     [ -r "$bundle/$asset" ] || die "缺少 $asset"
-    cp "$bundle/$asset" "$work/sm8750_scmi_plan_ro.ko"
-    load_owned sm8750_scmi_plan_ro
-    owned_plan=1
+    scmi_module_busy && die "SCMI 读表模块正在被其他程序使用"
+    insmod_scmi_asset "$asset" || die "加载 qcom-scmi-ro 失败（当前内核 $(uname -r)）"
 }
 
 report() {
@@ -740,32 +785,43 @@ print_cdt_write_log() {
     '
 }
 
+scmi_module_kernel_log() {
+    dmesg 2>/dev/null | awk '/qcom_scmi_ro:|qcom-scmi-ro:|sm8750_scmi_plan_ro:/'
+}
+
 read_sm8850_perf() {
-    if ! sm8850_plan_asset_present; then
+    local asset
+    if ! asset=$(sm8850_module_asset qcom-scmi-ro-sm8850); then
         printf 'SCMI_PERF=module_missing\n'
         return 1
     fi
-    if [ -d "$modules/sm8750_scmi_plan_ro" ]; then
+    if scmi_module_busy; then
         printf 'SCMI_PERF=module_busy\n'
         return 1
     fi
-    if ! cp "$bundle/sm8850_scmi_plan_ro.ko" "$work/sm8750_scmi_plan_ro.ko" ||
-        ! insmod "$work/sm8750_scmi_plan_ro.ko"; then
+    printf 'SCMI_PERF_MODULE=%s\n' "$asset"
+    scmi_module_kernel_log > "$work/scmi_dmesg_before"
+    if ! insmod_scmi_asset "$asset"; then
         printf 'SCMI_PERF=module_load_failed\n'
+        scmi_module_kernel_log > "$work/scmi_dmesg_after"
+        awk 'FILENAME == ARGV[1] { old[$0]++; next } old[$0] { old[$0]--; next } { print }' \
+            "$work/scmi_dmesg_before" "$work/scmi_dmesg_after" | tail -n 12
         return 1
     fi
-    owned_plan=1
     local result=0
-    if (plan) > "$work/scmi_perf.csv"; then
-        printf 'SCMI_PERF=ok\n'
-        cat "$work/scmi_perf.csv"
+    if (plan) > "$work/current"; then
+        if (validate_current_plan); then
+            printf 'SCMI_PERF=ok\n'
+        else
+            printf 'SCMI_PERF=invalid_plan\n'
+            result=1
+        fi
+        cat "$work/current"
     else
         printf 'SCMI_PERF=read_failed\n'
         result=1
     fi
-    if rmmod sm8750_scmi_plan_ro; then
-        owned_plan=0
-    else
+    if ! unload_scmi_module; then
         printf 'SCMI_PERF_UNLOAD=failed\n'
         result=1
     fi
@@ -777,6 +833,7 @@ collect_diagnostics() {
     local cdt_block= cdt_parent= cdt_sysfs= parent_sysfs=
     printf '[boot and kernel]\n'
     printf 'KERNEL_RELEASE=%s\n' "$(uname -r)"
+    printf 'KERNEL_PAGE_SIZE=%s\n' "$(kernel_page_size 2>/dev/null || printf unknown)"
     for prop in ro.boot.slot_suffix ro.boot.slot ro.boot.hardware ro.product.vendor.device         ro.vendor.build.fingerprint ro.soc.manufacturer ro.soc.model; do
         value=$(getprop "$prop")
         [ -z "$value" ] || printf '%s=%s\n' "$prop" "$value"
@@ -902,7 +959,7 @@ if [ "$action" = diagnostics ]; then
     exec 9>"$root/lock"
     flock -n 9 9>&9 || die "有另一个降压或烤机任务正在运行"
     work=$(mktemp -d "$root/diagnostics.XXXXXXXX")
-    trap 'if [ "$owned_plan" = 1 ]; then rmmod sm8750_scmi_plan_ro 2>/dev/null || true; fi; rm -rf -- "$work"' EXIT
+    trap 'unload_scmi_module 2>/dev/null || true; rm -rf -- "$work"' EXIT
     trap 'exit 143' TERM HUP INT
     collect_diagnostics
     if is_sm8850; then
