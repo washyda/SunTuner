@@ -18,6 +18,7 @@ V5_MTP = bytes.fromhex("05 08 01 00 00 00 00")
 V5_QRD = bytes.fromhex("05 0b 02 00 00 00 00")
 V6_MTP = bytes.fromhex("06 08 01 00 00 00 00 00 00 00")
 V6_QRD = bytes.fromhex("06 0b 02 00 00 00 00 00 00 00")
+PLK110_V6_STOCK = bytes.fromhex("06 08 01 00 00 00 00 60 ff")
 OLD_V6_MTP = bytes.fromhex("06 08 01 00 00 00 01 07 01")
 
 
@@ -227,6 +228,56 @@ class CdtKey7Tests(unittest.TestCase):
         self.assert_enabled(cdt_image(expected, second_block=other), "v6_10")
         self.restore()
         self.assertEqual(self.dev.read_bytes(), stock)
+
+    def test_plk110_compact_v6_preserves_oem_and_restores_exact_original(self):
+        stock = cdt_image(PLK110_V6_STOCK, second_block=b"DDR", second_offset=34)
+        self.dev.write_bytes(stock)
+        self.write_firmware(platform_dtb(PLK110_V6_STOCK), platform_dtb(PLK110_V6_STOCK + b"\x00"))
+        status = self.status()
+        self.assertEqual(status["CDT_DISK"], "stock")
+        self.assertEqual(status["CDT_LAYOUT"], "v6_9")
+        self.assertEqual(status["CDT_KEY7"], "absent")
+        self.assertEqual(status["CDT_V6_CAN_ENABLE"], "1")
+        self.enable()
+        expected = cdt_image(PLK110_V6_STOCK + b"\x01\x07\x01", second_block=b"DDR", second_offset=34)
+        self.assert_enabled(expected, "v6_10")
+        self.assertEqual(self.backup.read_bytes(), stock)
+        self.restore()
+        self.assertEqual(self.dev.read_bytes(), stock)
+
+    def test_compact_v6_needs_three_free_bytes(self):
+        self.write_firmware(platform_dtb(V6_MTP))
+        for stock in (
+            cdt_image(PLK110_V6_STOCK, second_block=b"DDR", second_offset=33),
+            cdt_image(PLK110_V6_STOCK)[:29] + b"\x45" + EMPTY[30:],
+        ):
+            self.dev.write_bytes(stock)
+            self.assertEqual(self.status()["CDT_V6_CAN_ENABLE"], "0")
+            self.enable(success=False)
+            self.assertEqual(self.dev.read_bytes(), stock)
+            self.assertFalse(self.backup.exists())
+
+    def test_empty_v6_accepts_compact_firmware_template(self):
+        self.write_firmware(platform_dtb(PLK110_V6_STOCK))
+        self.enable()
+        self.assert_enabled(cdt_image(PLK110_V6_STOCK + b"\x01\x07\x01"), "v6_10")
+        self.restore()
+        self.assertEqual(self.dev.read_bytes(), EMPTY)
+
+    def test_plk110_can_import_original_to_restore_old_misplaced_key(self):
+        stock = cdt_image(PLK110_V6_STOCK)
+        self.dev.write_bytes(cdt_image(bytes.fromhex("06 08 01 00 00 00 01 07 01 60 ff")))
+        self.imported.write_bytes(stock)
+        self.restore("--from-file", self.imported)
+        self.assertEqual(self.dev.read_bytes(), stock)
+
+    def test_nine_byte_legacy_key_is_not_rewritten_as_oem_data(self):
+        legacy = cdt_image(OLD_V6_MTP)
+        self.dev.write_bytes(legacy)
+        self.write_firmware(platform_dtb(V6_MTP))
+        self.assertEqual(self.status()["CDT_DISK"], "legacy_v6")
+        self.assertIn("CDT_ERR=legacy_v6_restore_required", self.enable(success=False))
+        self.assertEqual(self.dev.read_bytes(), legacy)
 
     def test_stock_v6_replaces_disabled_key_when_no_growth_fits(self):
         header = bytes.fromhex("06 08 01 00 00 12 34 56 78 01")

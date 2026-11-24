@@ -113,6 +113,7 @@ internal fun CompatibilityScreen(
                                 CompatibilityRow("CDT 布局", when (report.cdtLayout) {
                                     "v3_6" -> "v3 · 6 字节" to Tone.INFO
                                     "v4_v5_7" -> "v4/v5 · 7 字节" to Tone.INFO
+                                    "v6_9" -> "v6 · 9 字节（无键）" to Tone.INFO
                                     "v6_10" -> "v6 · 10 字节" to Tone.INFO
                                     "v6_legacy_7" -> "旧版 v6 · 7 字节" to Tone.WARNING
                                     else -> "未识别" to Tone.WARNING

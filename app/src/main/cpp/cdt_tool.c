@@ -48,7 +48,13 @@ static const cdb_layout_t cdb_layouts[] = {
     {6, 6, 10, 9, "v6_10"},
 };
 
+static int cdb_has_implicit_zero_count(size_t length, const cdb_layout_t *layout) {
+    /* Stock v6 can omit the zero key count after the four OEM bytes. */
+    return layout->header_size == 10 && length == layout->count_offset;
+}
+
 static int cdb_keys_fit(const uint8_t *data, size_t length, const cdb_layout_t *layout, int exact) {
+    if (cdb_has_implicit_zero_count(length, layout)) return 1;
     if (length < layout->header_size) return 0;
     size_t needed = layout->header_size + 2u * data[layout->count_offset];
     return exact ? needed == length : needed <= length;
@@ -488,7 +494,7 @@ static int parse_cdt_layout(const uint8_t *buf, size_t len, cdt_parsed_t *out, i
     out->subtype = p[4];
 
     out->fusion = (out->version == 5 || legacy_v6) ? p[5] : 0;
-    out->key_count = p[layout->count_offset];
+    out->key_count = cdb_has_implicit_zero_count(size0, layout) ? 0 : p[layout->count_offset];
     for (uint8_t i = 0; i < out->key_count; i++) {
         uint8_t k = p[layout->header_size + i * 2u];
         uint8_t v = p[layout->header_size + i * 2u + 1u];
@@ -576,14 +582,16 @@ static void match_platform_info(const uint8_t *data, size_t length, void *contex
         match->unsupported = 1;
         return;
     }
+    const size_t normalized_size = cdb_has_implicit_zero_count(length, layout) ? layout->header_size : length;
     if (hint->template_size != 0) {
-        if (hint->template_size != length || memcmp(hint->template, data, length) != 0) {
+        if (hint->template_size != normalized_size || memcmp(hint->template, data, length) != 0) {
             match->ambiguous = 1;
         }
         return;
     }
     memcpy(hint->template, data, length);
-    hint->template_size = length;
+    if (normalized_size > length) hint->template[length] = 0;
+    hint->template_size = normalized_size;
     hint->template_layout = layout;
 }
 
@@ -722,13 +730,15 @@ static int edit_cdb_key7(const uint8_t *orig, size_t part_len, const cdt_parsed_
                         uint8_t value, uint8_t *img, int shift_following_blocks) {
     const size_t header = parsed->descs[0].offset;
     const size_t key_start = header + parsed->layout->header_size;
-    const size_t growth = parsed->has_key7 ? 0 : 2;
+    const size_t old_size = parsed->descs[0].size;
+    const size_t count_growth = cdb_has_implicit_zero_count(old_size, parsed->layout) ? 1 : 0;
+    const size_t growth = parsed->has_key7 ? 0 : 2 + count_growth;
     if (growth && parsed->key_count == UINT8_MAX) {
         errno = EOVERFLOW;
         return -1;
     }
-    const size_t insert = key_start + (size_t)parsed->key_count * 2;
-    size_t end = header + parsed->descs[0].size;
+    const size_t insert = key_start + (size_t)parsed->key_count * 2 - count_growth;
+    size_t end = header + old_size;
     for (int i = 1; i < parsed->block_count; i++) {
         const cdt_desc_t *block = &parsed->descs[i];
         if (!block->size) continue;
@@ -750,9 +760,15 @@ static int edit_cdb_key7(const uint8_t *orig, size_t part_len, const cdt_parsed_
         }
         if (block_end > end) end = block_end;
     }
-    if (growth && (end + 2 > CDT_MAX_PAYLOAD || end + 2 > part_len || orig[end] || orig[end + 1])) {
+    if (end + growth > CDT_MAX_PAYLOAD || end + growth > part_len) {
         errno = ENOSPC;
         return -1;
+    }
+    for (size_t i = 0; i < growth; i++) {
+        if (orig[end + i]) {
+            errno = ENOSPC;
+            return -1;
+        }
     }
     if (!img) return 0;
     memcpy(img, orig, part_len);
@@ -762,14 +778,14 @@ static int edit_cdb_key7(const uint8_t *orig, size_t part_len, const cdt_parsed_
         }
         return 0;
     }
-    memmove(img + insert + 2, img + insert, end - insert);
+    memmove(img + insert + growth, img + insert, end - insert);
     img[header + parsed->layout->count_offset] = parsed->key_count + 1;
-    img[insert] = CDT_SLT_KEY;
-    img[insert + 1] = value;
-    write_u16_le(img + CDT_HEADER_SIZE + 2, parsed->descs[0].size + 2);
+    img[insert + count_growth] = CDT_SLT_KEY;
+    img[insert + count_growth + 1] = value;
+    write_u16_le(img + CDT_HEADER_SIZE + 2, old_size + growth);
     for (int i = 1; shift_following_blocks && i < parsed->block_count; i++) {
         if (parsed->descs[i].size) {
-            write_u16_le(img + CDT_HEADER_SIZE + i * 4, parsed->descs[i].offset + 2);
+            write_u16_le(img + CDT_HEADER_SIZE + i * 4, parsed->descs[i].offset + growth);
         }
     }
     return 0;
@@ -957,6 +973,12 @@ static int is_legacy_enabled(const uint8_t *data, size_t len, cdt_parsed_t *cdt)
            cdt->state == DISK_SLT_ENABLED && cdt->key7_val == 1;
 }
 
+static int may_be_legacy_enabled(const uint8_t *data, size_t len, const cdt_parsed_t *parsed) {
+    cdt_parsed_t legacy;
+    return (!parsed->layout || cdb_has_implicit_zero_count(parsed->descs[0].size, parsed->layout)) &&
+           is_legacy_enabled(data, len, &legacy);
+}
+
 static int matches_legacy_backup(const uint8_t *backup, const uint8_t *current, size_t len,
                                  int empty_backup) {
     cdt_parsed_t active;
@@ -1032,10 +1054,11 @@ static const char *backup_status(const char *path, const uint8_t *current, size_
 
 static disk_state_t print_disk_status(const uint8_t *buf, size_t len, const char *original_status) {
     cdt_parsed_t parsed;
-    int valid = parse_cdt(buf, len, &parsed) == 0;
-    cdt_parsed_t legacy;
+    parse_cdt(buf, len, &parsed);
     if (strcmp(original_status, "legacy_enabled_match") == 0 ||
-        (!valid && is_legacy_enabled(buf, len, &legacy))) parsed.state = DISK_LEGACY_V6;
+        (strcmp(original_status, "match") != 0 && may_be_legacy_enabled(buf, len, &parsed))) {
+        parsed.state = DISK_LEGACY_V6;
+    }
     printf("CDT_SIZE=%zu\n", len);
     printf("CDT_DISK=%s\n", disk_state_str(parsed.state));
     printf("CDT_BACKUP_STATUS=%s\n", original_status);
@@ -1089,6 +1112,7 @@ static int cmd_status_with_hint(const char *dev_path, const char *backup_path, c
         printf("BOOT_PLATFORM_INFO=unknown\n");
     }
     const cdb_layout_t *layout = NULL;
+    int compact_v6 = 0;
     const char *source = "none", *check = "unsupported";
     int can_enable = 0;
     if (disk_state == DISK_EMPTY) {
@@ -1110,6 +1134,7 @@ static int cmd_status_with_hint(const char *dev_path, const char *backup_path, c
         cdt_parsed_t parsed;
         parse_cdt(buf, len, &parsed);
         layout = parsed.layout;
+        compact_v6 = cdb_has_implicit_zero_count(parsed.descs[0].size, layout);
         source = "cdt";
         check = "confirmed";
         if (disk_state == DISK_STOCK) {
@@ -1125,7 +1150,7 @@ static int cmd_status_with_hint(const char *dev_path, const char *backup_path, c
         }
     }
     printf("CDT_LAYOUT=%s\nCDT_LAYOUT_SOURCE=%s\nCDT_LAYOUT_CHECK=%s\nCDT_LAYOUT_CAN_ENABLE=%d\n",
-           layout ? layout->name : "unknown", source, check, can_enable);
+           compact_v6 ? "v6_9" : (layout ? layout->name : "unknown"), source, check, can_enable);
     free(buf);
     return 0;
 }
@@ -1150,7 +1175,8 @@ static int cmd_enable_with_hint(
     }
 
     const char *original = backup_status(backup_path, buf, len);
-    if (strcmp(original, "legacy_enabled_match") == 0) {
+    if (strcmp(original, "legacy_enabled_match") == 0 ||
+        (strcmp(original, "match") != 0 && may_be_legacy_enabled(buf, len, &parsed))) {
         free(buf);
         fprintf(stderr, "CDT_ERR=legacy_v6_restore_required\n");
         return 3;
@@ -1255,9 +1281,9 @@ static int cmd_restore_with_hint(
             fprintf(stderr, "CDT_ERR=restore_image_invalid\n");
             return 3;
         }
-        cdt_parsed_t active, legacy;
-        int possible_legacy = parse_cdt(cur, cur_len, &active) != 0 &&
-                              is_legacy_enabled(cur, cur_len, &legacy);
+        cdt_parsed_t active;
+        parse_cdt(cur, cur_len, &active);
+        int possible_legacy = may_be_legacy_enabled(cur, cur_len, &active);
         if (!legacy_match && (import_path || possible_legacy) &&
             strcmp(status, "match") != 0 && strcmp(status, "enabled_match") != 0) {
             free(bak);
@@ -1470,7 +1496,8 @@ static int cmd_selftest(void) {
     memset(v6_image, 0, part_size);
     v6.template_size = 0;
     v6_ok = v6_ok && build_empty_cdt(v6_image, &v6, &cdb_v6_legacy, 1) == 0 &&
-            parse_cdt(v6_image, part_size, &p) != 0 &&
+            parse_cdt(v6_image, part_size, &p) == 0 && p.state == DISK_STOCK &&
+            may_be_legacy_enabled(v6_image, part_size, &p) &&
             strcmp(compare_backup(zeros, part_size, v6_image, part_size), "legacy_enabled_match") == 0;
     free(v6_image);
     if (!v6_ok) {
