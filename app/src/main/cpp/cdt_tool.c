@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "cdt_fdt.h"
+
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
@@ -27,7 +29,42 @@ enum {
     CDT_SLT_KEY = 7,
     CDT_PLATFORM_MTP = 8,
     CDT_PLATFORM_QRD = 11,
+    XBL_CONFIG_MAX_SIZE = 64 * 1024 * 1024,
+    CDB_MAX_SIZE = 10 + 2 * UINT8_MAX,
 };
+
+typedef struct {
+    uint8_t first_version;
+    uint8_t last_version;
+    size_t header_size;
+    size_t count_offset;
+    const char *name;
+} cdb_layout_t;
+
+static const cdb_layout_t cdb_v6_legacy = {6, 6, 7, 6, "v6_legacy_7"};
+static const cdb_layout_t cdb_layouts[] = {
+    {3, 3, 6, 5, "v3_6"},
+    {4, 5, 7, 6, "v4_v5_7"},
+    {6, 6, 10, 9, "v6_10"},
+};
+
+static int cdb_keys_fit(const uint8_t *data, size_t length, const cdb_layout_t *layout, int exact) {
+    if (length < layout->header_size) return 0;
+    size_t needed = layout->header_size + 2u * data[layout->count_offset];
+    return exact ? needed == length : needed <= length;
+}
+
+static const cdb_layout_t *find_cdb_layout(uint8_t version, const uint8_t *data, size_t length, int exact) {
+    const cdb_layout_t *match = NULL;
+    for (size_t i = 0; i < sizeof(cdb_layouts) / sizeof(*cdb_layouts); ++i) {
+        const cdb_layout_t *layout = &cdb_layouts[i];
+        if (version < layout->first_version || version > layout->last_version ||
+            (data && !cdb_keys_fit(data, length, layout, exact))) continue;
+        if (match) return NULL;
+        match = layout;
+    }
+    return match;
+}
 
 typedef struct {
     uint16_t offset;
@@ -48,6 +85,10 @@ typedef struct {
     uint8_t minor;
     uint8_t subtype;
     uint8_t fusion;
+    int requires_template;
+    const cdb_layout_t *template_layout;
+    size_t template_size;
+    uint8_t template[CDB_MAX_SIZE];
 } platform_hint_t;
 
 typedef enum {
@@ -55,6 +96,7 @@ typedef enum {
     DISK_STOCK = 1,
     DISK_SLT_ENABLED = 2,
     DISK_CORRUPT = 3,
+    DISK_LEGACY_V6,
 } disk_state_t;
 
 typedef struct {
@@ -65,6 +107,7 @@ typedef struct {
     uint8_t minor;
     uint8_t subtype;
     uint8_t fusion;
+    const cdb_layout_t *layout;
     uint8_t key_count;
     uint8_t keys[255];
     uint8_t vals[255];
@@ -383,7 +426,7 @@ static int replace_cdt(const char *device, const char *backup_path,
     return -1;
 }
 
-static int parse_cdt(const uint8_t *buf, size_t len, cdt_parsed_t *out) {
+static int parse_cdt_layout(const uint8_t *buf, size_t len, cdt_parsed_t *out, int legacy_v6) {
     memset(out, 0, sizeof(*out));
     int all_zero = 1;
     for (size_t i = 0; i < len; i++) {
@@ -429,38 +472,26 @@ static int parse_cdt(const uint8_t *buf, size_t len, cdt_parsed_t *out) {
             }
         }
     }
-    (void)size0;
-
     const uint8_t *p = buf + off0;
-    uint16_t psz = out->descs[0].size;
-    if (psz < 6) {
+    const cdb_layout_t *layout = legacy_v6
+        ? (p[0] == 6 && cdb_keys_fit(p, size0, &cdb_v6_legacy, 0) ? &cdb_v6_legacy : NULL)
+        : find_cdb_layout(p[0], p, size0, p[0] >= 6);
+    if (!layout) {
         out->state = DISK_CORRUPT;
         return -1;
     }
     out->version = p[0];
-    if (out->version < 3) {
-        out->state = DISK_CORRUPT;
-        return -1;
-    }
+    out->layout = layout;
     out->platform_id = p[1];
     out->major = p[2];
     out->minor = p[3];
     out->subtype = p[4];
 
-    size_t hdr_len = (out->version == 3) ? 6 : 7;
-    if (psz < hdr_len) {
-        out->state = DISK_CORRUPT;
-        return -1;
-    }
-    out->fusion = (out->version >= 5) ? p[5] : 0;
-    out->key_count = (out->version == 3) ? p[5] : p[6];
-    if (hdr_len + (size_t)out->key_count * 2u > psz) {
-        out->state = DISK_CORRUPT;
-        return -1;
-    }
+    out->fusion = (out->version == 5 || legacy_v6) ? p[5] : 0;
+    out->key_count = p[layout->count_offset];
     for (uint8_t i = 0; i < out->key_count; i++) {
-        uint8_t k = p[hdr_len + i * 2u];
-        uint8_t v = p[hdr_len + i * 2u + 1u];
+        uint8_t k = p[layout->header_size + i * 2u];
+        uint8_t v = p[layout->header_size + i * 2u + 1u];
         out->keys[i] = k;
         out->vals[i] = v;
         if (k == CDT_SLT_KEY) {
@@ -470,6 +501,10 @@ static int parse_cdt(const uint8_t *buf, size_t len, cdt_parsed_t *out) {
     }
     out->state = (out->has_key7 && out->key7_val != 0) ? DISK_SLT_ENABLED : DISK_STOCK;
     return 0;
+}
+
+static int parse_cdt(const uint8_t *buf, size_t len, cdt_parsed_t *out) {
+    return parse_cdt_layout(buf, len, out, 0);
 }
 
 static int read_small_text(const char *path, char *buf, size_t cap) {
@@ -509,31 +544,103 @@ static int read_platform_value(const char *path, unsigned long valid_bits, unsig
     return 1;
 }
 
-static uint8_t default_cdt_version(void) {
+static uint8_t default_cdt_version(int *requires_template) {
+    *requires_template = 0;
 #ifdef __ANDROID__
     char soc[PROP_VALUE_MAX];
     if (__system_property_get("ro.soc.model", soc) > 0) {
         if (strcasecmp(soc, "SM8750") == 0) return 5;
+        if (strcasecmp(soc, "SM8845") == 0) {
+            *requires_template = 1;
+            return 5;
+        }
         if (strcasecmp(soc, "SM8850") == 0 || strcasecmp(soc, "SM8850P") == 0) return 6;
     }
 #endif
     return 0;
 }
 
-static int resolve_empty_cdt_hint(platform_hint_t *hint) {
-    uint8_t default_version = default_cdt_version();
-    if (hint->state == PLATFORM_UNKNOWN && default_version) {
+typedef struct {
+    platform_hint_t *hint;
+    int unsupported;
+    int ambiguous;
+} platform_match_t;
+
+static void match_platform_info(const uint8_t *data, size_t length, void *context) {
+    platform_match_t *match = context;
+    platform_hint_t *hint = match->hint;
+    const uint8_t identity[] = {hint->ver, hint->platform_id, hint->major, hint->minor, hint->subtype};
+    if (length < sizeof(identity) || memcmp(data, identity, sizeof(identity)) != 0) return;
+    const cdb_layout_t *layout = find_cdb_layout(data[0], data, length, 1);
+    if (!layout || length > sizeof(hint->template)) {
+        match->unsupported = 1;
+        return;
+    }
+    if (hint->template_size != 0) {
+        if (hint->template_size != length || memcmp(hint->template, data, length) != 0) {
+            match->ambiguous = 1;
+        }
+        return;
+    }
+    memcpy(hint->template, data, length);
+    hint->template_size = length;
+    hint->template_layout = layout;
+}
+
+static const char *read_firmware_template(platform_hint_t *hint) {
+    const char *path = getenv("SUNTUNER_XBL_CONFIG");
+    uint8_t *image;
+    size_t size;
+    hint->template_size = 0;
+    hint->template_layout = NULL;
+    if (!path || !*path || read_file(path, &image, &size, XBL_CONFIG_MAX_SIZE) != 0) return "unavailable";
+    platform_match_t match = {.hint = hint};
+    cdt_visit_platform_info(image, size, match_platform_info, &match);
+    free(image);
+    if (match.ambiguous || (match.unsupported && hint->template_size != 0)) {
+        hint->template_size = 0;
+        hint->template_layout = NULL;
+        return "ambiguous";
+    }
+    if (match.unsupported) return "unsupported";
+    return hint->template_size != 0 ? "confirmed" : "no_match";
+}
+
+static platform_hint_t platform_from_cdt(const cdt_parsed_t *cdt) {
+    return (platform_hint_t){
+        .state = PLATFORM_IDENTIFIED, .ver = cdt->version, .platform_id = cdt->platform_id,
+        .major = cdt->major, .minor = cdt->minor, .subtype = cdt->subtype, .fusion = cdt->fusion,
+    };
+}
+
+static const cdb_layout_t *resolve_empty_cdt_hint(platform_hint_t *hint, const char **check) {
+    int requires_template;
+    uint8_t default_version = default_cdt_version(&requires_template);
+    /* Preserve the established SM8750 default when neither the boot log nor sysfs identify a board. */
+    if (hint->state == PLATFORM_UNKNOWN && default_version == 5 && !requires_template) {
         *hint = (platform_hint_t){
             .state = PLATFORM_IDENTIFIED, .ver = default_version, .platform_id = CDT_PLATFORM_MTP, .major = 1,
         };
     }
-    return hint->state == PLATFORM_IDENTIFIED && hint->ver >= 4 &&
-           (default_version != 6 || hint->ver == 6);
+    if (hint->state != PLATFORM_IDENTIFIED) {
+        *check = "platform_unknown";
+        return NULL;
+    }
+    if (hint->ver >= 6 || hint->requires_template) {
+        *check = read_firmware_template(hint);
+        return hint->template_layout;
+    }
+    const cdb_layout_t *layout = default_version != 6 && hint->ver >= 4
+        ? find_cdb_layout(hint->ver, NULL, 0, 0) : NULL;
+    *check = layout ? "confirmed" : "unsupported";
+    return layout;
 }
 
 static const char *detect_boot_cdt_state(platform_hint_t *hint) {
     static char boot_buf[262144];
     memset(hint, 0, sizeof(*hint));
+    int requires_template;
+    uint8_t default_version = default_cdt_version(&requires_template);
     int saw_version = 0;
     int saw_slt_not_found = 0;
     int saw_cdt_not_found = 0;
@@ -586,13 +693,13 @@ static const char *detect_boot_cdt_state(platform_hint_t *hint) {
             unsigned long sub_num = 0UL;
             int has_version = read_platform_value("/sys/devices/soc0/platform_version", 0x00ff00ffUL, &ver_num);
             int has_subtype = read_platform_value("/sys/devices/soc0/platform_subtype_id", UINT8_MAX, &sub_num);
-            uint8_t version = default_cdt_version();
-            if (platform_id == CDT_PLATFORM_QRD && (!version || !has_version || !has_subtype)) {
+            if ((platform_id == CDT_PLATFORM_QRD || requires_template) &&
+                (!default_version || !has_version || !has_subtype)) {
                 hint->state = PLATFORM_NO_DEFAULT;
             } else {
                 *hint = (platform_hint_t){
                     .state = PLATFORM_IDENTIFIED,
-                    .ver = version ? version : 5,
+                    .ver = default_version ? default_version : 5,
                     .platform_id = platform_id,
                     .major = (uint8_t)(ver_num >> 16),
                     .minor = (uint8_t)ver_num,
@@ -604,16 +711,17 @@ static const char *detect_boot_cdt_state(platform_hint_t *hint) {
         }
     }
 
+    hint->requires_template = requires_template;
     if (saw_slt_not_found || saw_cdt_not_found) return "not_found";
     if (saw_version) return "applied";
     return "unknown";
 }
 
-/* The legacy layout is used only to recognize images written by earlier builds. */
-static int edit_v6_key7(const uint8_t *orig, size_t part_len, const cdt_parsed_t *parsed,
-                        uint8_t value, uint8_t *img, int legacy_layout) {
+/* Shift later blocks only when matching images written by earlier builds. */
+static int edit_cdb_key7(const uint8_t *orig, size_t part_len, const cdt_parsed_t *parsed,
+                        uint8_t value, uint8_t *img, int shift_following_blocks) {
     const size_t header = parsed->descs[0].offset;
-    const size_t key_start = header + 7;
+    const size_t key_start = header + parsed->layout->header_size;
     const size_t growth = parsed->has_key7 ? 0 : 2;
     if (growth && parsed->key_count == UINT8_MAX) {
         errno = EOVERFLOW;
@@ -625,7 +733,7 @@ static int edit_v6_key7(const uint8_t *orig, size_t part_len, const cdt_parsed_t
         const cdt_desc_t *block = &parsed->descs[i];
         if (!block->size) continue;
         const size_t block_end = (size_t)block->offset + block->size;
-        if (!legacy_layout) {
+        if (!shift_following_blocks) {
             if (block->offset < end + growth && block_end > header) {
                 errno = ENOSPC;
                 return -1;
@@ -655,15 +763,52 @@ static int edit_v6_key7(const uint8_t *orig, size_t part_len, const cdt_parsed_t
         return 0;
     }
     memmove(img + insert + 2, img + insert, end - insert);
-    img[header + 6] = parsed->key_count + 1;
+    img[header + parsed->layout->count_offset] = parsed->key_count + 1;
     img[insert] = CDT_SLT_KEY;
     img[insert + 1] = value;
     write_u16_le(img + CDT_HEADER_SIZE + 2, parsed->descs[0].size + 2);
-    for (int i = 1; legacy_layout && i < parsed->block_count; i++) {
+    for (int i = 1; shift_following_blocks && i < parsed->block_count; i++) {
         if (parsed->descs[i].size) {
             write_u16_le(img + CDT_HEADER_SIZE + i * 4, parsed->descs[i].offset + 2);
         }
     }
+    return 0;
+}
+
+static int build_empty_cdt(uint8_t *image, const platform_hint_t *hint,
+                           const cdb_layout_t *layout, uint8_t value) {
+    const size_t offset = CDT_HEADER_SIZE + 4;
+    uint8_t *cdb = image + offset;
+    if (hint->template_size) {
+        memcpy(cdb, hint->template, hint->template_size);
+    } else {
+        cdb[0] = hint->ver;
+        cdb[1] = hint->platform_id;
+        cdb[2] = hint->major;
+        cdb[3] = hint->minor;
+        cdb[4] = hint->subtype;
+        if (hint->ver == 5 || layout == &cdb_v6_legacy) cdb[5] = hint->fusion;
+    }
+    size_t count = cdb[layout->count_offset];
+    uint8_t *keys = cdb + layout->header_size;
+    int found = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (keys[2 * i] != CDT_SLT_KEY) continue;
+        keys[2 * i + 1] = value;
+        found = 1;
+    }
+    if (!found) {
+        if (count == UINT8_MAX) {
+            errno = ENOSPC;
+            return -1;
+        }
+        keys[2 * count] = CDT_SLT_KEY;
+        keys[2 * count + 1] = value;
+        cdb[layout->count_offset] = (uint8_t)++count;
+    }
+    memcpy(image, "CDT\0", 4);
+    write_u16_le(image + CDT_HEADER_SIZE, offset);
+    write_u16_le(image + CDT_HEADER_SIZE + 2, (uint16_t)(layout->header_size + 2 * count));
     return 0;
 }
 
@@ -684,29 +829,25 @@ static int build_cdt_with_key7(
             *out_img = img;
             return 0;
         }
-        if (hint->state != PLATFORM_IDENTIFIED) {
+        const cdb_layout_t *layout = hint->template_layout;
+        if (!layout && hint->ver < 6 && !hint->requires_template) {
+            layout = find_cdb_layout(hint->ver, NULL, 0, 0);
+        }
+        if (hint->state != PLATFORM_IDENTIFIED || !layout) {
             free(img);
             errno = ENODEV;
             return -1;
         }
-        memcpy(img, "CDT\0", 4);
-        write_u16_le(img + CDT_HEADER_SIZE, 18);
-        write_u16_le(img + CDT_HEADER_SIZE + 2, 9);
-        img[18] = hint->ver;
-        img[19] = hint->platform_id;
-        img[20] = hint->major;
-        img[21] = hint->minor;
-        img[22] = hint->subtype;
-        img[23] = hint->fusion;
-        img[24] = 1;
-        img[25] = CDT_SLT_KEY;
-        img[26] = key7_value;
+        if (build_empty_cdt(img, hint, layout, key7_value) != 0) {
+            free(img);
+            return -1;
+        }
         *out_img = img;
         return 0;
     }
 
-    if (set_key7 && parsed->version == 6) {
-        if (edit_v6_key7(orig, part_len, parsed, key7_value, img, 0) != 0) {
+    if (set_key7 && parsed->version >= 6) {
+        if (edit_cdb_key7(orig, part_len, parsed, key7_value, img, 0) != 0) {
             free(img);
             return -1;
         }
@@ -759,7 +900,7 @@ static int build_cdt_with_key7(
         return 0;
     }
 
-    size_t hdr_len = (parsed->version == 3) ? 6 : 7;
+    size_t hdr_len = parsed->layout->header_size;
     size_t new_b0_size = hdr_len + (size_t)new_count * 2u;
     size_t desc_end = CDT_HEADER_SIZE + (size_t)parsed->block_count * 4u;
 
@@ -775,11 +916,7 @@ static int build_cdt_with_key7(
     write_u16_le(img + CDT_HEADER_SIZE, (uint16_t)cursor);
     write_u16_le(img + CDT_HEADER_SIZE + 2, (uint16_t)new_b0_size);
     memcpy(img + cursor, orig + parsed->descs[0].offset, hdr_len);
-    if (parsed->version == 3) {
-        img[cursor + 5] = new_count;
-    } else {
-        img[cursor + 6] = new_count;
-    }
+    img[cursor + parsed->layout->count_offset] = new_count;
     for (uint8_t i = 0; i < new_count; i++) {
         img[cursor + hdr_len + i * 2u] = new_keys[i];
         img[cursor + hdr_len + i * 2u + 1u] = new_vals[i];
@@ -810,44 +947,76 @@ static const char *disk_state_str(disk_state_t s) {
         case DISK_EMPTY: return "empty";
         case DISK_STOCK: return "stock";
         case DISK_SLT_ENABLED: return "slt_enabled";
+        case DISK_LEGACY_V6: return "legacy_v6";
         default: return "corrupt";
     }
 }
 
-static const char *compare_backup(const uint8_t *backup, size_t backup_len,
-                                  const uint8_t *current, size_t len) {
-    cdt_parsed_t parsed;
-    const char *status = "invalid";
-    if (backup_len == len && parse_cdt(backup, backup_len, &parsed) == 0 &&
-        (parsed.state == DISK_EMPTY || parsed.state == DISK_STOCK)) {
-        status = "mismatch";
-        if (memcmp(current, backup, len) == 0) {
-            status = "match";
-        } else {
-            cdt_parsed_t active;
-            if (parse_cdt(current, len, &active) == 0 &&
-                active.state == DISK_SLT_ENABLED && active.key7_val == 1) {
-                platform_hint_t hint = {0};
-                if (parsed.state == DISK_EMPTY) {
-                    /* The empty original has no header. Match the whole canonical image
-                     * using its on-disk header, independently of this boot's runtime data. */
-                    hint = (platform_hint_t){PLATFORM_IDENTIFIED, active.version, active.platform_id,
-                                             active.major, active.minor, active.subtype, active.fusion};
-                }
-                uint8_t *expected = NULL;
-                if (build_cdt_with_key7(backup, len, &parsed, &hint, 1, 1, &expected) == 0) {
-                    if (memcmp(current, expected, len) == 0) status = "enabled_match";
-                }
-                if (parsed.version == 6 && !parsed.has_key7 && strcmp(status, "mismatch") == 0) {
-                    if (!expected) expected = malloc(len);
-                    if (expected && edit_v6_key7(backup, len, &parsed, 1, expected, 1) == 0 &&
-                        memcmp(current, expected, len) == 0) status = "enabled_match";
-                }
-                free(expected);
+static int is_legacy_enabled(const uint8_t *data, size_t len, cdt_parsed_t *cdt) {
+    return parse_cdt_layout(data, len, cdt, 1) == 0 && cdt->layout == &cdb_v6_legacy &&
+           cdt->state == DISK_SLT_ENABLED && cdt->key7_val == 1;
+}
+
+static int matches_legacy_backup(const uint8_t *backup, const uint8_t *current, size_t len,
+                                 int empty_backup) {
+    cdt_parsed_t active;
+    if (!is_legacy_enabled(current, len, &active)) return 0;
+    uint8_t *expected = calloc(1, len);
+    if (!expected) return 0;
+    int match = 0;
+    if (empty_backup) {
+        platform_hint_t hint = platform_from_cdt(&active);
+        match = build_empty_cdt(expected, &hint, &cdb_v6_legacy, 1) == 0 &&
+                memcmp(current, expected, len) == 0;
+    } else {
+        cdt_parsed_t original;
+        if (parse_cdt_layout(backup, len, &original, 1) == 0 && original.state == DISK_STOCK) {
+            match = edit_cdb_key7(backup, len, &original, 1, expected, 0) == 0 &&
+                    memcmp(current, expected, len) == 0;
+            if (!match && !original.has_key7) {
+                match = edit_cdb_key7(backup, len, &original, 1, expected, 1) == 0 &&
+                        memcmp(current, expected, len) == 0;
             }
         }
     }
-    return status;
+    free(expected);
+    return match;
+}
+
+static const char *compare_backup(const uint8_t *backup, size_t backup_len,
+                                  const uint8_t *current, size_t len) {
+    if (backup_len != len) return "invalid";
+    cdt_parsed_t parsed;
+    int stock = parse_cdt(backup, len, &parsed) == 0 &&
+                (parsed.state == DISK_EMPTY || parsed.state == DISK_STOCK);
+    if (stock) {
+        if (memcmp(current, backup, len) == 0) return "match";
+        cdt_parsed_t active;
+        if (parse_cdt(current, len, &active) == 0 &&
+            active.state == DISK_SLT_ENABLED && active.key7_val == 1) {
+            platform_hint_t hint = platform_from_cdt(&active);
+            if (parsed.state == DISK_EMPTY && (active.version >= 6 || active.key_count > 1)) {
+                read_firmware_template(&hint);
+                if (hint.template_layout != active.layout && active.key_count == 1) {
+                    /* A canonical single-key image can still match an empty backup after an OTA. */
+                    hint.template_layout = active.layout;
+                    hint.template_size = active.layout->header_size;
+                    memcpy(hint.template, current + active.descs[0].offset, hint.template_size);
+                    hint.template[active.layout->count_offset] = 0;
+                }
+            }
+            uint8_t *expected = NULL;
+            if (build_cdt_with_key7(backup, len, &parsed, &hint, 1, 1, &expected) == 0) {
+                int matches = memcmp(current, expected, len) == 0;
+                free(expected);
+                if (matches) return "enabled_match";
+            }
+        }
+    }
+    if (matches_legacy_backup(backup, current, len, stock && parsed.state == DISK_EMPTY)) {
+        return "legacy_enabled_match";
+    }
+    return stock ? "mismatch" : "invalid";
 }
 
 static const char *backup_status(const char *path, const uint8_t *current, size_t len) {
@@ -863,14 +1032,14 @@ static const char *backup_status(const char *path, const uint8_t *current, size_
 
 static disk_state_t print_disk_status(const uint8_t *buf, size_t len, const char *original_status) {
     cdt_parsed_t parsed;
-    parse_cdt(buf, len, &parsed);
+    int valid = parse_cdt(buf, len, &parsed) == 0;
+    cdt_parsed_t legacy;
+    if (strcmp(original_status, "legacy_enabled_match") == 0 ||
+        (!valid && is_legacy_enabled(buf, len, &legacy))) parsed.state = DISK_LEGACY_V6;
     printf("CDT_SIZE=%zu\n", len);
     printf("CDT_DISK=%s\n", disk_state_str(parsed.state));
     printf("CDT_BACKUP_STATUS=%s\n", original_status);
-    if (parsed.version == 6 && parsed.state == DISK_STOCK) {
-        printf("CDT_V6_CAN_ENABLE=%d\n", edit_v6_key7(buf, len, &parsed, 1, NULL, 0) == 0);
-    }
-    if (parsed.has_key7) {
+    if (parsed.has_key7 && parsed.state != DISK_LEGACY_V6) {
         printf("CDT_KEY7=%u\n", parsed.key7_val);
     } else {
         printf("CDT_KEY7=absent\n");
@@ -895,7 +1064,7 @@ static disk_state_t print_disk_status(const uint8_t *buf, size_t len, const char
     return parsed.state;
 }
 
-static int cmd_status(const char *dev_path, const char *backup_path) {
+static int cmd_status_with_hint(const char *dev_path, const char *backup_path, const platform_hint_t *override_hint) {
     uint8_t *buf = NULL;
     size_t len = 0;
     if (read_file_exact(dev_path, &buf, &len) != 0) {
@@ -904,10 +1073,14 @@ static int cmd_status(const char *dev_path, const char *backup_path) {
     }
     printf("CDT_DEV=%s\n", dev_path);
     disk_state_t disk_state = print_disk_status(buf, len, backup_status(backup_path, buf, len));
-    free(buf);
 
     platform_hint_t hint;
-    const char *boot_state = detect_boot_cdt_state(&hint);
+    const char *boot_state = "unknown";
+    if (override_hint) {
+        hint = *override_hint;
+    } else {
+        boot_state = detect_boot_cdt_state(&hint);
+    }
     printf("BOOT_CDT=%s\n", boot_state);
     if (hint.state == PLATFORM_IDENTIFIED) {
         printf("BOOT_PLATFORM_INFO=%u,%u,%u,%u,%u,%u\n",
@@ -915,9 +1088,45 @@ static int cmd_status(const char *dev_path, const char *backup_path) {
     } else {
         printf("BOOT_PLATFORM_INFO=unknown\n");
     }
+    const cdb_layout_t *layout = NULL;
+    const char *source = "none", *check = "unsupported";
+    int can_enable = 0;
     if (disk_state == DISK_EMPTY) {
-        printf("CDT_EMPTY_CAN_ENABLE=%d\n", resolve_empty_cdt_hint(&hint));
+        layout = resolve_empty_cdt_hint(&hint, &check);
+        source = hint.ver >= 6 || hint.requires_template ? "active_xbl_config" : "platform";
+        can_enable = layout != NULL;
+        if (hint.template_size && hint.template[layout->count_offset] == UINT8_MAX) {
+            can_enable = 0;
+            for (size_t i = layout->header_size; i < hint.template_size; i += 2) {
+                if (hint.template[i] == CDT_SLT_KEY) can_enable = 1;
+            }
+        }
+        printf("CDT_EMPTY_CAN_ENABLE=%d\n", can_enable);
+    } else if (disk_state == DISK_LEGACY_V6) {
+        layout = &cdb_v6_legacy;
+        source = "legacy_app";
+        check = "restore_required";
+    } else if (disk_state == DISK_STOCK || disk_state == DISK_SLT_ENABLED) {
+        cdt_parsed_t parsed;
+        parse_cdt(buf, len, &parsed);
+        layout = parsed.layout;
+        source = "cdt";
+        check = "confirmed";
+        if (disk_state == DISK_STOCK) {
+            can_enable = 1;
+            if (parsed.version >= 6) {
+                hint = platform_from_cdt(&parsed);
+                check = read_firmware_template(&hint);
+                source = "cdt_and_active_xbl_config";
+                if (hint.template_layout && hint.template_layout != layout) check = "layout_mismatch";
+                can_enable = hint.template_layout == layout && edit_cdb_key7(buf, len, &parsed, 1, NULL, 0) == 0;
+                printf("CDT_V6_CAN_ENABLE=%d\n", can_enable);
+            }
+        }
     }
+    printf("CDT_LAYOUT=%s\nCDT_LAYOUT_SOURCE=%s\nCDT_LAYOUT_CHECK=%s\nCDT_LAYOUT_CAN_ENABLE=%d\n",
+           layout ? layout->name : "unknown", source, check, can_enable);
+    free(buf);
     return 0;
 }
 
@@ -941,6 +1150,11 @@ static int cmd_enable_with_hint(
     }
 
     const char *original = backup_status(backup_path, buf, len);
+    if (strcmp(original, "legacy_enabled_match") == 0) {
+        free(buf);
+        fprintf(stderr, "CDT_ERR=legacy_v6_restore_required\n");
+        return 3;
+    }
     if (strcmp(original, "mismatch") == 0 || strcmp(original, "invalid") == 0) {
         free(buf);
         fprintf(stderr, "CDT_ERR=backup_%s\n", original);
@@ -959,21 +1173,18 @@ static int cmd_enable_with_hint(
     } else {
         detect_boot_cdt_state(&detected);
     }
-    if (parsed.state == DISK_EMPTY && !resolve_empty_cdt_hint(&detected)) {
-        free(buf);
-        fprintf(stderr, "CDT_ERR=empty_platform_unsupported\n");
-        return 4;
+    const char *check = "confirmed";
+    if (parsed.state == DISK_EMPTY) {
+        resolve_empty_cdt_hint(&detected, &check);
+    } else if (parsed.version >= 6) {
+        detected = platform_from_cdt(&parsed);
+        check = read_firmware_template(&detected);
+        if (detected.template_layout && detected.template_layout != parsed.layout) check = "layout_mismatch";
     }
-
-    /* Persist original unmodified partition ONCE; never overwrite with a Key7!=0 image. */
-    if (strcmp(original, "missing") == 0 && parsed.state != DISK_SLT_ENABLED) {
-        if (save_backup_atomic(backup_path, buf, len) != 0) {
-            free(buf);
-            fprintf(stderr, "cdt_tool: failed to save original CDT backup %s: %s\n",
-                    backup_path, strerror(errno));
-            return 3;
-        }
-        original = "match";
+    if (strcmp(check, "confirmed") != 0) {
+        free(buf);
+        fprintf(stderr, "CDT_ERR=layout_unconfirmed:%s\n", check);
+        return 4;
     }
 
     uint8_t *new_img = NULL;
@@ -985,6 +1196,17 @@ static int cmd_enable_with_hint(
             fprintf(stderr, "cdt_tool: build SLT CDT failed: %s\n", strerror(errno));
         }
         return 4;
+    }
+    /* Save the original only after the candidate builds successfully. */
+    if (strcmp(original, "missing") == 0 && parsed.state != DISK_SLT_ENABLED) {
+        if (save_backup_atomic(backup_path, buf, len) != 0) {
+            free(new_img);
+            free(buf);
+            fprintf(stderr, "cdt_tool: failed to save original CDT backup %s: %s\n",
+                    backup_path, strerror(errno));
+            return 3;
+        }
+        original = "match";
     }
     int rc = replace_cdt(dev_path, backup_path, buf, new_img, len);
     int saved = errno;
@@ -1025,23 +1247,29 @@ static int cmd_restore_with_hint(
             fprintf(stderr, "CDT_ERR=restore_image_size\n");
             return 2;
         }
-        cdt_parsed_t bak_parsed;
-        if (parse_cdt(bak, bak_len, &bak_parsed) != 0 ||
-            (bak_parsed.state != DISK_EMPTY && bak_parsed.state != DISK_STOCK)) {
+        const char *status = compare_backup(bak, bak_len, cur, cur_len);
+        int legacy_match = strcmp(status, "legacy_enabled_match") == 0;
+        if (strcmp(status, "invalid") == 0) {
             free(bak);
             free(cur);
             fprintf(stderr, "CDT_ERR=restore_image_invalid\n");
             return 3;
         }
+        cdt_parsed_t active, legacy;
+        int possible_legacy = parse_cdt(cur, cur_len, &active) != 0 &&
+                              is_legacy_enabled(cur, cur_len, &legacy);
+        if (!legacy_match && (import_path || possible_legacy) &&
+            strcmp(status, "match") != 0 && strcmp(status, "enabled_match") != 0) {
+            free(bak);
+            free(cur);
+            fprintf(stderr, "CDT_ERR=restore_image_mismatch\n");
+            return 3;
+        }
         if (import_path) {
-            const char *import_status = compare_backup(bak, bak_len, cur, cur_len);
-            if (strcmp(import_status, "match") != 0 && strcmp(import_status, "enabled_match") != 0) {
-                free(bak);
-                free(cur);
-                fprintf(stderr, "CDT_ERR=restore_image_mismatch\n");
-                return 3;
-            }
             const char *stored_status = backup_status(backup_path, bak, bak_len);
+            if (legacy_match && strcmp(stored_status, "missing") != 0) {
+                stored_status = image_matches(backup_path, bak, bak_len) ? "match" : "mismatch";
+            }
             if (strcmp(stored_status, "mismatch") == 0 ||
                 (strcmp(stored_status, "match") != 0 &&
                  (save_backup_atomic(backup_path, bak, bak_len) != 0 || sync_parent(backup_path) != 0))) {
@@ -1133,7 +1361,7 @@ static int cmd_selftest(void) {
     if (!f || fwrite(zeros, 1, part_size, f) != part_size) return 1;
     fclose(f);
 
-    platform_hint_t mtp = {PLATFORM_IDENTIFIED, 5, 8, 1, 0, 0, 0};
+    platform_hint_t mtp = {.state = PLATFORM_IDENTIFIED, .ver = 5, .platform_id = 8, .major = 1};
     if (cmd_enable_with_hint(dev, bak, &mtp) != 0) return 1;
 
     uint8_t *enabled = NULL;
@@ -1223,6 +1451,33 @@ static int cmd_selftest(void) {
     free(restored);
     free(multi);
 
+    /* Verified SM8850 image from a matching stock xbl_config and the old misplaced-key image. */
+    static const uint8_t v6_expected[] = {
+        'C', 'D', 'T', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        18, 0, 12, 0, 6, 8, 1, 0, 0, 0, 0, 0, 0, 1, 7, 1,
+    };
+    platform_hint_t v6 = {
+        .state = PLATFORM_IDENTIFIED, .ver = 6, .platform_id = 8, .major = 1,
+        .template_size = 10, .template = {6, 8, 1},
+    };
+    v6.template_layout = find_cdb_layout(v6.ver, v6.template, v6.template_size, 1);
+    cdt_parsed_t empty = {.state = DISK_EMPTY};
+    uint8_t *v6_image = NULL;
+    if (build_cdt_with_key7(zeros, part_size, &empty, &v6, 1, 1, &v6_image) != 0) return 1;
+    int v6_ok = memcmp(v6_image, v6_expected, sizeof(v6_expected)) == 0 &&
+                parse_cdt(v6_image, part_size, &p) == 0 && p.key7_val == 1 &&
+                strcmp(compare_backup(zeros, part_size, v6_image, part_size), "enabled_match") == 0;
+    memset(v6_image, 0, part_size);
+    v6.template_size = 0;
+    v6_ok = v6_ok && build_empty_cdt(v6_image, &v6, &cdb_v6_legacy, 1) == 0 &&
+            parse_cdt(v6_image, part_size, &p) != 0 &&
+            strcmp(compare_backup(zeros, part_size, v6_image, part_size), "legacy_enabled_match") == 0;
+    free(v6_image);
+    if (!v6_ok) {
+        fprintf(stderr, "selftest: v6 layout or legacy backup matching failed\n");
+        return 1;
+    }
+
     /* Reject corrupt non-zero non-CDT garbage. */
     memset(enabled, 0x5a, 64);
     f = fopen(dev, "wb");
@@ -1262,7 +1517,7 @@ int main(int argc, char **argv) {
         return cmd_selftest();
     }
     if ((argc == 3 || argc == 4) && strcmp(argv[1], "status") == 0) {
-        return cmd_status(argv[2], argc == 4 ? argv[3] : NULL);
+        return cmd_status_with_hint(argv[2], argc == 4 ? argv[3] : NULL, NULL);
     }
     if (argc == 4 && strcmp(argv[1], "backup") == 0) {
         return cmd_backup(argv[2], argv[3]);

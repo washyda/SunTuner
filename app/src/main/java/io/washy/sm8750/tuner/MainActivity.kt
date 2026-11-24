@@ -11,14 +11,14 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -27,13 +27,13 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -42,7 +42,6 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -51,6 +50,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.washy.sm8750.tuner.ui.BenchmarkScreen
 import io.washy.sm8750.tuner.ui.CompatibilityScreen
 import io.washy.sm8750.tuner.ui.CrashLogScreen
+import io.washy.sm8750.tuner.ui.ExpressiveLoadingIndicator
 import io.washy.sm8750.tuner.ui.TunerTheme
 import io.washy.sm8750.tuner.ui.TunerThemeTokens
 import io.washy.sm8750.tuner.ui.VoltageScreen
@@ -114,8 +114,7 @@ class MainActivity : ComponentActivity() {
                     onPreset = model::applyPreset,
                     onCore = model::toggleCore,
                     onThreads = model::setThreads,
-                    onSeconds = model::setSeconds,
-                    onQuickSeconds = model::setQuickSeconds,
+                    onDuration = model::setDuration,
                     onMode = model::setFrequencyMode,
                     onWorkload = model::setWorkload,
                     onFrequency = model::setFixedFrequency,
@@ -137,7 +136,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TunerApp(
     state: ScreenState,
@@ -159,8 +157,7 @@ private fun TunerApp(
     onPreset: (Set<Int>) -> Unit,
     onCore: (Int) -> Unit,
     onThreads: (String) -> Unit,
-    onSeconds: (String) -> Unit,
-    onQuickSeconds: (Int) -> Unit,
+    onDuration: (Int) -> Unit,
     onMode: (FrequencyMode) -> Unit,
     onWorkload: (WorkloadKind) -> Unit,
     onFrequency: (Int, Int) -> Unit,
@@ -233,14 +230,11 @@ private fun TunerApp(
     }
 
     Scaffold(
-        topBar = {
-            when (tab) {
-                1 -> TopAppBar(title = { Text(stringResource(R.string.app_name)) })
-                2 -> TopAppBar(title = { Text("崩溃日志") })
-            }
-        },
         bottomBar = {
-            NavigationBar {
+            NavigationBar(
+                containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                tonalElevation = 0.dp,
+            ) {
                 NavigationBarItem(
                     selected = tab == 0,
                     onClick = { tab = 0 },
@@ -266,72 +260,84 @@ private fun TunerApp(
             Box(Modifier.fillMaxSize().padding(padding)) { crashLogContent() }
             return@Scaffold
         }
-        Column(Modifier.fillMaxSize().padding(padding)) {
-            if (state.operation != null && state.operation != Operation.LOADING) {
-                LinearProgressIndicator(Modifier.fillMaxWidth())
-            }
-            if (state.operation != null && state.operation != Operation.LOADING && state.status != null) {
-                Text(
-                    state.status,
-                    Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            state.error?.let { err ->
-                Surface(
-                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                    color = TunerThemeTokens.extended.dangerContainer,
-                    shape = MaterialTheme.shapes.medium,
-                ) {
-                    Column(Modifier.padding(12.dp)) {
-                        Text(
-                            err,
-                            color = TunerThemeTokens.extended.danger,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                        if (state.cdtFailureFeedback) {
-                            TextButton(
-                                onClick = onExportCdtFailureLog,
-                                enabled = state.operation == null,
-                            ) { Text("导出完整刷入日志") }
+        Box(Modifier.fillMaxSize().padding(padding)) {
+            Column(Modifier.fillMaxSize()) {
+                state.error?.let { err ->
+                    Surface(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                        color = TunerThemeTokens.extended.dangerContainer,
+                        shape = MaterialTheme.shapes.medium,
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(
+                                err,
+                                color = TunerThemeTokens.extended.danger,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            if (state.cdtFailureFeedback) {
+                                TextButton(
+                                    onClick = onExportCdtFailureLog,
+                                    enabled = state.operation == null,
+                                ) { Text("导出完整刷入日志") }
+                            }
                         }
                     }
                 }
+                if (tab == 0 && state.hasCdtFailureLog && !state.cdtFailureFeedback) {
+                    TextButton(
+                        onClick = onExportCdtFailureLog,
+                        enabled = state.operation == null,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    ) { Text("导出上次刷入失败日志") }
+                }
+                Box(Modifier.weight(1f)) {
+                    if (tab == 0) {
+                        VoltageScreen(
+                            state = state,
+                            onRefresh = onRefresh,
+                            onCheckCompatibility = onCheckCompatibility,
+                            onBackupCdt = onBackupCdt,
+                            onEnableCdt = onEnableCdt,
+                            onRestoreCdt = onRestoreCdt,
+                            onRestoreCdtFromFile = onRestoreCdtFromFile,
+                            onRebootNow = onRebootNow,
+                        )
+                    } else {
+                        BenchmarkScreen(
+                            state = state,
+                            onPreset = onPreset,
+                            onCore = onCore,
+                            onThreads = onThreads,
+                            onDuration = onDuration,
+                            onMode = onMode,
+                            onWorkload = onWorkload,
+                            onFrequency = onFrequency,
+                            onStart = onStart,
+                            onStop = onStop,
+                        )
+                    }
+                }
             }
-            if (tab == 0 && state.hasCdtFailureLog && !state.cdtFailureFeedback) {
-                TextButton(
-                    onClick = onExportCdtFailureLog,
-                    enabled = state.operation == null,
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                ) { Text("导出上次刷入失败日志") }
-            }
-            Box(Modifier.weight(1f)) {
-                if (tab == 0) {
-                    VoltageScreen(
-                        state = state,
-                        onRefresh = onRefresh,
-                        onCheckCompatibility = onCheckCompatibility,
-                        onBackupCdt = onBackupCdt,
-                        onEnableCdt = onEnableCdt,
-                        onRestoreCdt = onRestoreCdt,
-                        onRestoreCdtFromFile = onRestoreCdtFromFile,
-                        onRebootNow = onRebootNow,
-                    )
-                } else {
-                    BenchmarkScreen(
-                        state = state,
-                        onPreset = onPreset,
-                        onCore = onCore,
-                        onThreads = onThreads,
-                        onSeconds = onSeconds,
-                        onQuickSeconds = onQuickSeconds,
-                        onMode = onMode,
-                        onWorkload = onWorkload,
-                        onFrequency = onFrequency,
-                        onStart = onStart,
-                        onStop = onStop,
-                    )
+            val operation = state.operation
+            if (operation != null && operation != Operation.LOADING &&
+                (tab != 0 || operation != Operation.READING)
+            ) {
+                Surface(
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(horizontal = 20.dp, vertical = 10.dp),
+                    shape = RoundedCornerShape(24.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    shadowElevation = 3.dp,
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        ExpressiveLoadingIndicator(Modifier.size(28.dp))
+                        state.status?.let { status ->
+                            Text(status, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
                 }
             }
         }
@@ -418,7 +424,7 @@ private fun TunerPreview() {
             onBackupCdt = {}, onDismissCdtBackupResult = {},
             onEnableCdt = {}, onRestoreCdt = {}, onRestoreCdtFromFile = {}, onRestoreFallbackClean = {},
             onDismissRestoreNoBackup = {}, onRebootNow = {}, onDismissReboot = {},
-            onPreset = {}, onCore = {}, onThreads = {}, onSeconds = {}, onQuickSeconds = {},
+            onPreset = {}, onCore = {}, onThreads = {}, onDuration = {},
             onMode = {}, onWorkload = {}, onFrequency = { _, _ -> }, onStart = {}, onStop = {},
         )
     }

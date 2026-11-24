@@ -51,10 +51,17 @@ internal class LoadControl {
 internal class MissingCdtBackupException(message: String) : IllegalStateException(message)
 internal enum class CdtOutcome { VERIFIED, UNCHANGED, ROLLED_BACK, UNKNOWN }
 
-internal data class CdtPartition(val bootId: String, val disk: String, val backupStatus: String) {
+internal data class CdtPartition(
+    val bootId: String,
+    val disk: String,
+    val backupStatus: String,
+    val standalone: Boolean = false,
+    val layoutCanEnable: Boolean = false,
+    val pendingReboot: Boolean = false,
+) {
     val state: PlanState?
         get() = when {
-            backupStatus == "mismatch" -> PlanState.CDT_RECOVERY_REQUIRED
+            disk == "legacy_v6" || backupStatus == "mismatch" -> PlanState.CDT_RECOVERY_REQUIRED
             disk == "corrupt" || backupStatus == "invalid" -> PlanState.CORRUPT_CDT
             disk == "slt_enabled" -> PlanState.CDT_WRITTEN
             disk == "empty" || disk == "stock" -> PlanState.STOCK_UNMODIFIED
@@ -62,7 +69,10 @@ internal data class CdtPartition(val bootId: String, val disk: String, val backu
         }
 
     val canRestore: Boolean
-        get() = disk == "slt_enabled" || backupStatus in setOf("match", "enabled_match", "mismatch")
+        get() = disk in setOf("slt_enabled", "legacy_v6") || backupStatus in setOf("match", "enabled_match", "mismatch")
+
+    val canEnableWithoutPlan: Boolean
+        get() = standalone && disk == "empty" && layoutCanEnable && state == PlanState.STOCK_UNMODIFIED
 }
 
 internal data class CdtOperationResult(
@@ -301,6 +311,9 @@ internal class RootBackend(private val context: Context) {
             bootId = requireNotNull(trace.field("BOOT", " ")),
             disk = requireNotNull(trace.field("CDT_DISK")),
             backupStatus = requireNotNull(trace.field("CDT_BACKUP_STATUS")),
+            standalone = trace.field("CDT_STANDALONE") == "1",
+            layoutCanEnable = trace.field("CDT_EMPTY_CAN_ENABLE") == "1",
+            pendingReboot = trace.field("CDT_PENDING_REBOOT") == "1",
         )
     }
 
@@ -346,20 +359,21 @@ internal class RootBackend(private val context: Context) {
         val partition = if (outcome == CdtOutcome.UNKNOWN) null else reportOrNull(log) {
             parsePartition(traceCommand(listOf("cdt_status"), log))
         }
-        val plan = if (partition == null) null else reportOrNull(log) {
+        val plan = if (partition == null || partition.standalone) null else reportOrNull(log) {
             val report = traceCommand(listOf("read"), log)
             report.failure?.let { throw it }
             parsePlan(report.output)
         }
+        val reportMissing = plan == null && partition?.standalone != true
         val message = when (outcome) {
-            CdtOutcome.VERIFIED -> if (plan == null) "CDT 校验通过，电压计划读取失败，可稍后刷新。" else null
+            CdtOutcome.VERIFIED -> if (reportMissing) "CDT 校验通过，电压计划读取失败，可稍后刷新。" else null
             CdtOutcome.UNCHANGED -> "CDT 未改动。\n${operationFailure?.message ?: "写入未开始。"}"
             CdtOutcome.ROLLED_BACK -> "操作失败，已恢复并校验操作前的 CDT。"
             CdtOutcome.UNKNOWN -> "无法确认 CDT 操作结果。请先刷新并检查恢复结果，再重启。"
         }
         log.appendLine("FINAL_CDT_RESULT=$outcome")
         log.appendLine("END_UTC=${Instant.now()}")
-        val logSaved = (outcome != CdtOutcome.VERIFIED || operationFailure != null || plan == null) &&
+        val logSaved = (outcome != CdtOutcome.VERIFIED || operationFailure != null || reportMissing) &&
             saveCdtFailureLog(log.toString())
         CdtOperationResult(outcome, partitionChanged, partition, plan, message, logSaved)
     }

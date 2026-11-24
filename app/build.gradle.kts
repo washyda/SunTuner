@@ -7,15 +7,15 @@ plugins {
 
 android {
     namespace = "io.washy.sm8750.tuner"
-    compileSdk = 36
+    compileSdk = 37
     ndkVersion = "27.3.13750724"
 
     defaultConfig {
         applicationId = "io.washy.sm8750.tuner"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("15").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.4.10beta").get()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("16").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("0.5.0beta").get()
     }
 
     buildTypes {
@@ -93,13 +93,16 @@ val buildLoadWorker = registerNativeBinary(
     "buildLoadWorker", "src/main/cpp/load.c", "load", listOf("-pthread"),
     listOf("src/main/cpp/openblas/sgemm_kernel_16x4.S"),
 )
-val buildCdtTool = registerNativeBinary("buildCdtTool", "src/main/cpp/cdt_tool.c", "cdt_tool")
+val buildCdtTool = registerNativeBinary(
+    "buildCdtTool", "src/main/cpp/cdt_tool.c", "cdt_tool",
+    extraSources = listOf("src/main/cpp/cdt_fdt.c"),
+).also { task -> task.configure { inputs.file("src/main/cpp/cdt_fdt.h") } }
 val buildCrashLogFilter = registerNativeBinary("buildCrashLogFilter", "src/main/cpp/crash_log_filter.c", "crash_log_filter")
 android.sourceSets["main"].assets.directories.addAll(listOf(generatedAssets.get().asFile.path, generatedNativeAssets.get().asFile.path))
 tasks.named("preBuild") { dependsOn(generateBackend, buildLoadWorker, buildCdtTool, buildCrashLogFilter) }
 
 dependencies {
-    implementation(platform("androidx.compose:compose-bom:2026.03.00"))
+    implementation(platform("androidx.compose:compose-bom:2026.11.01"))
     implementation("androidx.activity:activity-compose:1.12.4")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.10.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")

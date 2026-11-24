@@ -30,6 +30,8 @@ internal val CORE_PRESETS = listOf(
     CorePreset("单核 CPU6", setOf(6)),
 )
 
+internal val BENCHMARK_DURATIONS_SECONDS = listOf(15, 30, 60)
+
 internal data class ScreenState(
     val plan: DevicePlan? = null,
     val benchmarkDevice: BenchmarkDevice? = null,
@@ -50,12 +52,19 @@ internal data class ScreenState(
     val pendingRestoreNoBackup: Boolean = false,
     val cores: Set<Int> = (0..7).toSet(),
     val threads: String = "8",
-    val seconds: String = "15",
+    val durationSeconds: Int = BENCHMARK_DURATIONS_SECONDS.first(),
     val frequencyMode: FrequencyMode = FrequencyMode.MAX,
     val workload: WorkloadKind = WorkloadKind.FP,
     val fixedFrequencies: Map<Int, Int> = emptyMap(),
     val lastRun: LoadRun? = null,
 ) {
+    val cdtEnableBootId: String?
+        get() = when {
+            cdtUncertain -> null
+            cdtPartition?.standalone == true -> cdtPartition.takeIf { it.canEnableWithoutPlan }?.bootId
+            else -> plan?.takeIf { it.state == PlanState.STOCK_UNMODIFIED && it.cdtFlashSupported }?.bootId
+        }
+
     val benchmarkOnline: Set<Int> get() = benchmarkDevice?.online ?: plan?.online.orEmpty()
     val benchmarkFrequencies: Map<Int, List<Int>>
         get() = benchmarkDevice?.frequencies ?: plan?.current.orEmpty().frequenciesByDomain()
@@ -64,7 +73,6 @@ internal data class ScreenState(
         get() {
             if (frequencyMode == FrequencyMode.FIXED && benchmarkDevice?.fixedSupported == false) return null
             val threadCount = threads.toIntOrNull() ?: return null
-            val duration = seconds.toIntOrNull()?.takeIf { it >= 5 } ?: return null
             val domains = cores.map(::domainFor).toSet()
             val targets = if (frequencyMode == FrequencyMode.FIXED) domains.mapNotNull { domain ->
                 val frequencies = benchmarkFrequencies[domain].orEmpty()
@@ -72,7 +80,7 @@ internal data class ScreenState(
                     ?: frequencies.maxOrNull()
                 selected?.let { domain to it }
             }.toMap() else emptyMap()
-            return LoadConfig(cores, threadCount, duration, frequencyMode, targets, workload).takeIf { it.valid }
+            return LoadConfig(cores, threadCount, durationSeconds, frequencyMode, targets, workload).takeIf { it.valid }
         }
 }
 
@@ -87,6 +95,8 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     private val backend = RootBackend(app)
     private val isSm8850 = Build.VERSION.SDK_INT >= 31 &&
         (Build.SOC_MODEL.equals("SM8850", ignoreCase = true) || Build.SOC_MODEL.equals("SM8850P", ignoreCase = true))
+    private val isSm8845 = Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL.equals("SM8845", ignoreCase = true)
+    private val usesSysfsFrequencies = isSm8850 || isSm8845
     private val crashLogStore = CrashLogStore(app)
     private val _crashLogState = MutableStateFlow(CrashLogState())
     val crashLogState = _crashLogState.asStateFlow()
@@ -97,7 +107,7 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         // The legacy refresh loads PJZ110-specific probe modules.
-        if (isSm8850 || Build.MODEL.equals("PJZ110", ignoreCase = true)) refresh()
+        if (usesSysfsFrequencies || Build.MODEL.equals("PJZ110", ignoreCase = true)) refresh()
     }
 
     fun refreshCrashLogs() = updateCrashLogs("读取崩溃日志失败") {
@@ -219,7 +229,7 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(cdtPartition = null, hasCdtFailureLog = backend.hasCdtFailureLog) }
             Result.failure(e)
         }
-        val cpu = if (isSm8850) {
+        val cpu = if (usesSysfsFrequencies) {
             val device = try {
                 backend.readBenchmarkDevice()
             } catch (e: CancellationException) {
@@ -297,11 +307,9 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
     fun dismissCdtBackupResult() = _state.update { it.copy(cdtBackupResult = null) }
 
     fun enableCdt() {
-        val plan = _state.value.plan ?: return
-        if (plan.state != PlanState.STOCK_UNMODIFIED || !plan.cdtFlashSupported) return
-        if (_state.value.cdtUncertain) return
+        val bootId = _state.value.cdtEnableBootId ?: return
         launchOperation(Operation.WRITING_CDT, "正在备份原厂 CDT 并写入 Key 7 = 1…") {
-            applyCdtResult(backend.enableCdt(plan.bootId), RebootPrompt.ENABLED_CDT)
+            applyCdtResult(backend.enableCdt(bootId), RebootPrompt.ENABLED_CDT)
         }
     }
 
@@ -318,7 +326,7 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 applyCdtResult(backend.restoreCdt(bootId, fallbackClean, source), RebootPrompt.RESTORED_CDT)
             } catch (e: MissingCdtBackupException) {
-                if (isSm8850) throw IllegalStateException("未找到这台设备的完整原厂 CDT 备份，无法还原", e)
+                if (usesSysfsFrequencies) throw IllegalStateException("未找到这台设备的完整原厂 CDT 备份，无法还原", e)
                 _state.update { it.copy(pendingRestoreNoBackup = true) }
             }
         }
@@ -373,12 +381,16 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    fun setThreads(input: String) = setNumber(input, 2) { state, value -> state.copy(threads = value) }
+    fun setThreads(input: String) {
+        if (input.length <= 2 && input.all { it in '0'..'9' }) {
+            _state.update { if (it.operation == null) it.copy(threads = input) else it }
+        }
+    }
 
-    fun setSeconds(input: String) = setNumber(input, 4) { state, value -> state.copy(seconds = value) }
-
-    fun setQuickSeconds(sec: Int) = _state.update {
-        if (it.operation == null) it.copy(seconds = sec.toString()) else it
+    fun setDuration(seconds: Int) = _state.update {
+        if (it.operation == null && seconds in BENCHMARK_DURATIONS_SECONDS) {
+            it.copy(durationSeconds = seconds)
+        } else it
     }
 
     fun setFrequencyMode(mode: FrequencyMode) = _state.update {
@@ -391,12 +403,6 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setFixedFrequency(domain: Int, khz: Int) = _state.update {
         if (it.operation == null) it.copy(fixedFrequencies = it.fixedFrequencies + (domain to khz)) else it
-    }
-
-    private fun setNumber(input: String, digits: Int, change: (ScreenState, String) -> ScreenState) {
-        if (input.length <= digits && input.all { it in '0'..'9' }) {
-            _state.update { if (it.operation == null) change(it, input) else it }
-        }
     }
 
     fun startLoad() {

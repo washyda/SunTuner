@@ -21,6 +21,10 @@ internal class CompatibilityReport(
     val bootId = rootValues["DIAGNOSTIC_BOOT_ID"]?.takeIf { it.isNotBlank() }
     val slotSuffix = rootValues["DIAGNOSTIC_SLOT"]?.takeIf { it == "_a" || it == "_b" }
     val cdtDisk = rootValues["CDT_DISK"]
+    val cdtLayout = rootValues["CDT_LAYOUT"]
+    val cdtLayoutSource = rootValues["CDT_LAYOUT_SOURCE"]
+    val cdtLayoutCheck = rootValues["CDT_LAYOUT_CHECK"]
+    val cdtLayoutCanEnable = rootValues["CDT_LAYOUT_CAN_ENABLE"] == "1"
     val cdtRead = rootValues["CDT_READ"]
     val recoveryPending = rootValues["CDT_TRANSACTION"] == "pending_recovery"
     val readOnlyFlags = listOf("CDT_BLOCKDEV_RO", "CDT_SYSFS_RO", "CDT_PARENT_SYSFS_RO").mapNotNull(rootValues::get)

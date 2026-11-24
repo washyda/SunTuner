@@ -1,7 +1,10 @@
 package io.washy.sm8750.tuner.ui
 
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Shapes
+import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
@@ -10,6 +13,8 @@ import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 
 @Immutable
 internal data class TunerExtendedColors(
@@ -57,53 +62,73 @@ internal object TunerThemeTokens {
 
 internal fun TextStyle.tabular(): TextStyle = copy(fontFeatureSettings = "tnum")
 
+private val LightScheme = lightColorScheme(
+    primary = Color(0xFF4858CE),
+    onPrimary = Color.White,
+    primaryContainer = Color(0xFFDDE1FF),
+    onPrimaryContainer = Color(0xFF17256B),
+    secondary = Color(0xFF565E80),
+    onSecondary = Color.White,
+    secondaryContainer = Color(0xFFDDE2FF),
+    onSecondaryContainer = Color(0xFF202B54),
+    background = Color(0xFFF9F7FF),
+    surface = Color(0xFFF9F7FF),
+    surfaceContainerLowest = Color.White,
+    surfaceContainerLow = Color(0xFFF1EFFF),
+    surfaceContainer = Color(0xFFECEAF9),
+    surfaceContainerHigh = Color(0xFFE6E4F5),
+    surfaceContainerHighest = Color(0xFFDFDDF1),
+    onSurface = Color(0xFF202136),
+    onSurfaceVariant = Color(0xFF54566F),
+    outline = Color(0xFF787A92),
+    outlineVariant = Color(0xFFCACBE0),
+)
+
+private val DarkScheme = darkColorScheme(
+    primary = Color(0xFFBDC4FF),
+    onPrimary = Color(0xFF19246B),
+    primaryContainer = Color(0xFF303B83),
+    onPrimaryContainer = Color(0xFFE1E4FF),
+    secondary = Color(0xFFBFC6EA),
+    onSecondary = Color(0xFF292F50),
+    secondaryContainer = Color(0xFF3E4567),
+    onSecondaryContainer = Color(0xFFE0E6FF),
+    background = Color(0xFF141523),
+    surface = Color(0xFF141523),
+    surfaceContainerLowest = Color(0xFF10111E),
+    surfaceContainerLow = Color(0xFF1B1D2D),
+    surfaceContainer = Color(0xFF222438),
+    surfaceContainerHigh = Color(0xFF2B2D45),
+    surfaceContainerHighest = Color(0xFF363853),
+    onSurface = Color(0xFFE7E5F6),
+    onSurfaceVariant = Color(0xFFC5C5DC),
+    outline = Color(0xFF9092AB),
+    outlineVariant = Color(0xFF43465D),
+)
+
+private val TunerShapes = Shapes(
+    small = RoundedCornerShape(12.dp),
+    medium = RoundedCornerShape(16.dp),
+    large = RoundedCornerShape(24.dp),
+    extraLarge = RoundedCornerShape(30.dp),
+)
+
+private val BaseTypography = Typography()
+private val TunerTypography = Typography(
+    headlineLarge = BaseTypography.headlineLarge.copy(fontWeight = FontWeight.Medium),
+    titleLarge = BaseTypography.titleLarge.copy(fontWeight = FontWeight.Medium),
+    titleMedium = BaseTypography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+)
+
 @Composable
 internal fun TunerTheme(content: @Composable () -> Unit) {
     val dark = isSystemInDarkTheme()
-    val scheme = if (dark) {
-        darkColorScheme(
-            primary = Color(0xFF7BE0A8),
-            onPrimary = Color(0xFF063922),
-            primaryContainer = Color(0xFF144B32),
-            onPrimaryContainer = Color(0xFFBBF7D3),
-            secondary = Color(0xFF9CD4BE),
-            onSecondary = Color(0xFF0C372A),
-            secondaryContainer = Color(0xFF1F4D3D),
-            onSecondaryContainer = Color(0xFFB8F0DA),
-            background = Color(0xFF0E1310),
-            surface = Color(0xFF121814),
-            surfaceContainerLowest = Color(0xFF0B0F0C),
-            surfaceContainerLow = Color(0xFF171E19),
-            surfaceContainer = Color(0xFF1D2620),
-            surfaceContainerHigh = Color(0xFF253028),
-            surfaceContainerHighest = Color(0xFF2E3B32),
-            onSurface = Color(0xFFE4ECE6),
-            onSurfaceVariant = Color(0xFFB4C3B8),
-            outlineVariant = Color(0xFF334037),
-        )
-    } else {
-        lightColorScheme(
-            primary = Color(0xFF136F46),
-            onPrimary = Color.White,
-            primaryContainer = Color(0xFFD6F5E3),
-            onPrimaryContainer = Color(0xFF073B23),
-            secondary = Color(0xFF2D6551),
-            onSecondary = Color.White,
-            secondaryContainer = Color(0xFFD3ECE0),
-            onSecondaryContainer = Color(0xFF113F2F),
-            background = Color(0xFFF4F6F3),
-            surface = Color(0xFFF4F6F3),
-            surfaceContainerLowest = Color.White,
-            surfaceContainerLow = Color(0xFFEEF2EC),
-            surfaceContainer = Color(0xFFE5ECE5),
-            surfaceContainerHigh = Color(0xFFDDE6DD),
-            surfaceContainerHighest = Color(0xFFD4DFD5),
-            onSurface = Color(0xFF152019),
-            onSurfaceVariant = Color(0xFF47574C),
-            outlineVariant = Color(0xFFC5D2C7),
-        )
-    }
     CompositionLocalProvider(LocalExtendedColors provides if (dark) DarkExtended else LightExtended) {
-        MaterialTheme(colorScheme = scheme, content = content)
+        MaterialTheme(
+            colorScheme = if (dark) DarkScheme else LightScheme,
+            shapes = TunerShapes,
+            typography = TunerTypography,
+            content = content,
+        )
     }
 }

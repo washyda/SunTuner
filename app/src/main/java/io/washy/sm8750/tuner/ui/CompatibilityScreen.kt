@@ -8,10 +8,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -61,7 +63,13 @@ internal fun CompatibilityScreen(
                         )
                     }
                     Button(onClick = onSave, enabled = !saving, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (saving) "正在保存…" else "保存兼容性包")
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            if (saving) ExpressiveLoadingIndicator(Modifier.size(24.dp), color = LocalContentColor.current)
+                            Text(if (saving) "正在保存…" else "保存兼容性包")
+                        }
                     }
                 }
             }
@@ -93,12 +101,43 @@ internal fun CompatibilityScreen(
                             HorizontalDivider()
                             CompatibilityRow("CDT 分区", when {
                                 report.recoveryPending -> "有待恢复记录" to Tone.WARNING
+                                report.cdtDisk == "legacy_v6" -> "旧版写入 · 需还原" to Tone.WARNING
                                 report.cdtDisk == "slt_enabled" -> "CDT 已写入" to Tone.INFO
                                 report.cdtDisk in setOf("empty", "stock") -> "原厂状态" to Tone.NEUTRAL
                                 report.cdtDisk == "corrupt" -> "分区数据异常" to Tone.DANGER
                                 report.cdtRead == "partition_not_found" -> "未找到分区" to Tone.WARNING
                                 else -> "无法确认" to Tone.WARNING
                             })
+                            if (report.cdtLayout != null) {
+                                HorizontalDivider()
+                                CompatibilityRow("CDT 布局", when (report.cdtLayout) {
+                                    "v3_6" -> "v3 · 6 字节" to Tone.INFO
+                                    "v4_v5_7" -> "v4/v5 · 7 字节" to Tone.INFO
+                                    "v6_10" -> "v6 · 10 字节" to Tone.INFO
+                                    "v6_legacy_7" -> "旧版 v6 · 7 字节" to Tone.WARNING
+                                    else -> "未识别" to Tone.WARNING
+                                })
+                                CompatibilityRow("布局来源", when (report.cdtLayoutSource) {
+                                    "active_xbl_config" -> "活动槽 xbl_config" to Tone.INFO
+                                    "cdt_and_active_xbl_config" -> "CDT 与 xbl_config" to Tone.INFO
+                                    "cdt" -> "当前 CDT" to Tone.INFO
+                                    "platform" -> "平台信息" to Tone.INFO
+                                    "legacy_app" -> "旧版 SunTuner" to Tone.WARNING
+                                    else -> "无" to Tone.WARNING
+                                })
+                                CompatibilityRow("布局校验", when (report.cdtLayoutCheck) {
+                                    "restore_required" -> "需先还原" to Tone.WARNING
+                                    "ambiguous" -> "模板不唯一" to Tone.WARNING
+                                    "unavailable" -> "固件不可读" to Tone.WARNING
+                                    "no_match" -> "无匹配模板" to Tone.WARNING
+                                    "confirmed" -> when {
+                                        report.cdtLayoutCanEnable -> "符合写入布局" to Tone.POSITIVE
+                                        report.cdtDisk == "slt_enabled" -> "已解析" to Tone.INFO
+                                        else -> "没有足够空间" to Tone.WARNING
+                                    }
+                                    else -> "布局未确认" to Tone.WARNING
+                                })
+                            }
                             HorizontalDivider()
                             CompatibilityRow("CDT 只读标记", when {
                                 "1" in report.readOnlyFlags -> "检测到只读" to Tone.WARNING
