@@ -184,7 +184,14 @@ kernel_module_asset() {
                 ;;
         esac
     elif is_sm8845; then
-        return 1
+        [ "$name" = qcom-scmi-ro ] || return 1
+        # The SCMI structs and all module CRCs match this Android 15 GKI.
+        case "$(uname -r)" in
+            6.6.139-android15-8-g5d4cdf2ffe45-*) ;;
+            *) return 1 ;;
+        esac
+        pages=$(kernel_page_size) || return 1
+        [ "$pages" = 4096 ] || return 1
     fi
     local asset="modules/$directory/$name.ko"
     [ -r "$bundle/$asset" ] || return 1
@@ -193,11 +200,7 @@ kernel_module_asset() {
 
 sm8850_cdt_ready() {
     [ "$state" = STOCK_UNMODIFIED ] && stock_baseline_candidate || return 1
-    case "$cdt_disk" in
-        empty) [ "$cdt_empty_can_enable" = 1 ] ;;
-        stock) [ "$cdt_v6_can_enable" = 1 ] ;;
-        *) return 1 ;;
-    esac
+    [ "$cdt_layout_can_enable" = 1 ]
 }
 
 sm8850_boost_frequencies() {
@@ -280,7 +283,6 @@ check_firmware() {
     fi
     case "$action" in
         read|cdt_enable)
-            ! is_sm8845 || die "SM8845 电压计划不可用"
             [ -d /sys/bus/scmi_protocol ] || die "缺少 /sys/bus/scmi_protocol 接口" ;;
     esac
 }
@@ -352,7 +354,7 @@ read_cdt_status() {
     cdt_key7=absent
     cdt_platform=none
     cdt_empty_can_enable=0
-    cdt_v6_can_enable=0
+    cdt_layout_can_enable=0
     cdt_backup_status=missing
     while IFS='=' read -r k v; do
         case "$k" in
@@ -360,7 +362,7 @@ read_cdt_status() {
             CDT_KEY7) cdt_key7=$v ;;
             CDT_PLATFORM) cdt_platform=$v ;;
             CDT_EMPTY_CAN_ENABLE) cdt_empty_can_enable=$v ;;
-            CDT_V6_CAN_ENABLE) cdt_v6_can_enable=$v ;;
+            CDT_LAYOUT_CAN_ENABLE) cdt_layout_can_enable=$v ;;
             CDT_BACKUP_STATUS) cdt_backup_status=$v ;;
             BOOT_CDT) boot_cdt=$v ;;
             BOOT_PLATFORM_INFO) boot_platform_info=$v ;;
@@ -442,7 +444,7 @@ load_scmi_module() {
 report() {
     inspect_state
     plan > "$work/current"
-    if is_sm8850; then
+    if uses_sysfs_frequencies; then
         validate_current_plan
     fi
     maybe_persist_stock_baseline "$work/current"
@@ -491,7 +493,7 @@ plan_frequencies() {
 
 validate_current_plan() {
     plan_frequencies "$work/current" > "$work/current.freq" || die "SCMI 电压计划校验失败"
-    if is_sm8850; then
+    if uses_sysfs_frequencies; then
         cpu_frequencies > "$work/cpu.freq" ||
             die "无法读取系统频点校验 SCMI 电压计划"
         awk '
@@ -500,7 +502,7 @@ validate_current_plan() {
                 domain = $2 == 0 ? 0 : 1
                 for (i = 3; i <= NF; i++) if (!plan[domain, $i]) exit 1
             }
-        ' "$work/current.freq" "$work/cpu.freq" || die "SM8850 系统频点与 SCMI 电压计划不匹配"
+        ' "$work/current.freq" "$work/cpu.freq" || die "系统频点与 SCMI 计划不匹配"
     fi
 }
 
@@ -525,8 +527,9 @@ emit_report() {
             [ "$state" = CDT_WRITTEN ]; then
             printf 'CDT_PENDING_REBOOT 1\n'
         fi
-    elif [ "$cdt_disk" = empty ]; then
-        flash_supported=$cdt_empty_can_enable
+    else
+        if is_sm8845; then printf 'PLAN_MODEL SM8845\n'; fi
+        flash_supported=$cdt_layout_can_enable
     fi
     printf 'CDT_FLASH_SUPPORTED %s\n' "$flash_supported"
 
@@ -790,7 +793,7 @@ scmi_module_kernel_log() {
     dmesg 2>/dev/null | awk '/qcom_scmi_ro:|qcom-scmi-ro:|sm8750_scmi_plan_ro:/'
 }
 
-read_sm8850_perf() {
+probe_scmi_perf() {
     local asset
     if ! asset=$(kernel_module_asset qcom-scmi-ro); then
         printf 'SCMI_PERF=module_missing\n'
@@ -1008,9 +1011,9 @@ if [ "$action" = diagnostics ]; then
     trap 'unload_scmi_module 2>/dev/null || true; rm -rf -- "$work"' EXIT
     trap 'exit 143' TERM HUP INT
     collect_diagnostics
-    if is_sm8850; then
+    if uses_sysfs_frequencies; then
         printf '\n[cpu scmi perf probe]\n'
-        read_sm8850_perf || true
+        probe_scmi_perf || true
     fi
     exit 0
 fi

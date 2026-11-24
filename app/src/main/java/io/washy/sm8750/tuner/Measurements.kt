@@ -8,11 +8,11 @@ internal data class Level(
     val index: Int,
     val khz: Int,
     val microwatts: Int,
-    val coefficient: Long,
+    val coefficient: Long?,
 ) {
     val millivolts: Int?
         get() {
-            val denominator = coefficient * khz
+            val denominator = (coefficient ?: return null) * khz
             val mV = (sqrt(microwatts * 1e9 / denominator) / 4).roundToInt() * 4
             return mV.takeIf { denominator * it * it / 1_000_000_000 == microwatts.toLong() }
         }
@@ -47,6 +47,7 @@ internal data class DevicePlan(
     val baseline: List<Level>?,
     val current: List<Level>,
     val sm8850: Boolean = false,
+    val estimatedScmiVoltage: Boolean = false,
     val cdtFlashSupported: Boolean = true,
     val cdtPendingReboot: Boolean = false,
 )
@@ -305,7 +306,9 @@ internal fun parsePlan(output: String): DevicePlan {
     val lines = output.lines()
     fun field(name: String) = lines.single { it.startsWith("$name ") }.substringAfter(' ')
     fun optionalField(name: String) = lines.singleOrNull { it.startsWith("$name ") }?.substringAfter(' ')
-    val sm8850 = optionalField("PLAN_MODEL") == "SM8850"
+    val model = optionalField("PLAN_MODEL")
+    val sm8850 = model == "SM8850"
+    val sm8845 = model == "SM8845"
     fun rows(name: String): List<Level> {
         val start = lines.indexOf("BEGIN $name")
         require(start >= 0) { "SCMI 计划缺失" }
@@ -316,7 +319,7 @@ internal fun parsePlan(output: String): DevicePlan {
                 require(p.size == 7 && p[1] == p[6] && p[3] > 0 && p[5] > 0)
                 val coefficient = when (p[0]) {
                     0 -> 100L
-                    1 -> if (sm8850) 150L else 136L
+                    1 -> if (sm8850 || sm8845) 150L else 136L
                     else -> error("未知 SCMI 性能域 ${p[0]}")
                 }
                 Level(p[0], p[1], p[5], p[3], coefficient)
@@ -329,6 +332,9 @@ internal fun parsePlan(output: String): DevicePlan {
                 domain.zipWithNext().all { (a, b) -> a.khz < b.khz }
         }) { "SCMI 计划不完整" }
         if (sm8850) require(levels.all { it.millivolts != null }) { "SM8850 SCMI 电压模型校验失败" }
+        if (sm8845 && levels.any { it.millivolts == null }) {
+            return levels.map { it.copy(coefficient = null) }
+        }
         return levels
     }
 
@@ -362,6 +368,7 @@ internal fun parsePlan(output: String): DevicePlan {
         baseline = baseline,
         current = current,
         sm8850 = sm8850,
+        estimatedScmiVoltage = sm8850 || sm8845,
         cdtFlashSupported = optionalField("CDT_FLASH_SUPPORTED")?.let { it == "1" } ?: !sm8850,
         cdtPendingReboot = optionalField("CDT_PENDING_REBOOT") == "1",
     )

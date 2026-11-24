@@ -131,6 +131,7 @@ internal fun CompatibilityScreen(
                                     "ambiguous" -> "模板不唯一" to Tone.WARNING
                                     "unavailable" -> "固件不可读" to Tone.WARNING
                                     "no_match" -> "无匹配模板" to Tone.WARNING
+                                    "no_space" -> "没有足够空间" to Tone.WARNING
                                     "confirmed" -> when {
                                         report.cdtLayoutCanEnable -> "符合写入布局" to Tone.POSITIVE
                                         report.cdtDisk == "slt_enabled" -> "已解析" to Tone.INFO

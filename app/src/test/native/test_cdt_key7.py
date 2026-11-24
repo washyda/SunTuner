@@ -229,6 +229,30 @@ class CdtKey7Tests(unittest.TestCase):
         self.restore()
         self.assertEqual(self.dev.read_bytes(), stock)
 
+    def test_v2546a_stock_v5_uses_disk_layout_instead_of_v6_default(self):
+        stock_v5 = bytes.fromhex("05 0b 01 00 00 00 00")
+        stock = bytearray(cdt_image(stock_v5, second_block=b"DDR"))
+        stock[-1] = 0x5A
+        self.dev.write_bytes(stock)
+        self.write_firmware(platform_dtb(V6_MTP))
+        inferred_platform = bytes.fromhex("06 0b 01 00 00")
+        self.assertEqual(self.status(inferred_platform)["CDT_LAYOUT_CAN_ENABLE"], "1")
+        self.enable(inferred_platform)
+        expected = bytearray(stock)
+        struct.pack_into("<H", expected, 16, 9)
+        expected[28:31] = b"\x01\x07\x01"
+        self.assert_enabled(bytes(expected), "v4_v5_7")
+        self.restore()
+        self.assertEqual(self.dev.read_bytes(), stock)
+
+    def test_preexisting_repacked_v5_matches_imported_backup(self):
+        stock = cdt_image(V5_MTP, second_block=b"DDR", second_offset=64)
+        old_enabled = cdt_image(V5_MTP[:6] + b"\x01\x07\x01", second_block=b"DDR", second_offset=31)
+        self.dev.write_bytes(old_enabled)
+        self.imported.write_bytes(stock)
+        self.restore("--from-file", self.imported)
+        self.assertEqual(self.dev.read_bytes(), stock)
+
     def test_plk110_compact_v6_preserves_oem_and_restores_exact_original(self):
         stock = cdt_image(PLK110_V6_STOCK, second_block=b"DDR", second_offset=34)
         self.dev.write_bytes(stock)

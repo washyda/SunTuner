@@ -72,7 +72,11 @@ internal fun VoltageScreen(
 ) {
     val device = state.plan
     val currentLevels = device?.current.orEmpty()
+    val showPower = currentLevels.firstOrNull()?.let { it.coefficient == null } == true
     val partition = state.cdtPartition
+    val systemFrequencies = if (partition?.standalone == true && device == null) {
+        state.benchmarkDevice?.frequencies.orEmpty()
+    } else emptyMap()
     val cdtDisk = partition?.disk ?: device?.cdtDisk
     val legacyCdt = cdtDisk == "legacy_v6"
     val cdtState = when {
@@ -127,7 +131,7 @@ internal fun VoltageScreen(
         else -> planStateTag(cdtState)
     }
     val comparisonBaseline = device?.takeIf {
-        it.baselineSource == BaselineSource.PERSISTED &&
+        !showPower && it.baselineSource == BaselineSource.PERSISTED &&
             (it.state == PlanState.CDT_WRITTEN || it.state == PlanState.EXTERNAL_RUNTIME)
     }?.baseline
     val tables = remember(currentLevels, comparisonBaseline) {
@@ -174,7 +178,7 @@ internal fun VoltageScreen(
                 contentPadding = PaddingValues(vertical = 6.dp),
                 verticalArrangement = Arrangement.spacedBy(1.dp),
             ) {
-                if (tables.isEmpty() && !busy && state.error == null) {
+                if (tables.isEmpty() && systemFrequencies.isEmpty() && !busy && state.error == null) {
                     item {
                         Text(
                             when {
@@ -188,11 +192,22 @@ internal fun VoltageScreen(
                         )
                     }
                 }
-                if (tables.isNotEmpty()) {
+                for ((domain, frequencies) in systemFrequencies.toSortedMap()) {
+                    item(key = "system_$domain") {
+                        Column(Modifier.padding(horizontal = 7.dp, vertical = 4.dp)) {
+                            Text("PDP$domain · 系统频点 MHz", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                frequencies.asReversed().joinToString(" · ") { decimal(it / 1000.0) },
+                                style = MaterialTheme.typography.bodySmall.tabular(),
+                            )
+                        }
+                    }
+                }
+                if (tables.isNotEmpty() && !showPower) {
                     item(key = "chart") {
                         VoltageChartCard(
                             tables = tables,
-                            estimated = device?.sm8850 == true,
+                            estimated = device?.estimatedScmiVoltage == true,
                             modifier = Modifier.fillMaxWidth().padding(bottom = 5.dp),
                         )
                     }
@@ -211,6 +226,7 @@ internal fun VoltageScreen(
                                     )
                                     VoltageTableRow(
                                         comparison = table.baseline.isNotEmpty(),
+                                        showPower = showPower,
                                         shapeCount = table.levels.size + 1,
                                     )
                                 }
@@ -226,6 +242,7 @@ internal fun VoltageScreen(
                                 } else {
                                     VoltageTableRow(
                                         comparison = table.baseline.isNotEmpty(),
+                                        showPower = showPower,
                                         modifier = Modifier.weight(1f),
                                         level = level,
                                         original = table.baseline[level.khz]?.millivolts,
@@ -502,6 +519,7 @@ private fun CombinedVoltageChartPreview() {
 private fun VoltageTableRow(
     comparison: Boolean,
     modifier: Modifier = Modifier,
+    showPower: Boolean = false,
     level: Level? = null,
     original: Int? = null,
     shapeIndex: Int = 0,
@@ -533,8 +551,12 @@ private fun VoltageTableRow(
                 Text(if (level == null) "原厂" else original?.toString() ?: "—", Modifier.weight(.85f),
                     style = style, textAlign = TextAlign.End, color = secondary)
             }
-            Text(if (level == null) if (comparison) "当前" else "电压 mV" else current?.toString() ?: "—",
-                Modifier.weight(.85f), style = style, textAlign = TextAlign.End)
+            val value = when {
+                showPower -> level?.let { decimal(it.microwatts / 1000.0) } ?: "估算功耗 mW"
+                level == null -> if (comparison) "当前" else "电压 mV"
+                else -> current?.toString() ?: "—"
+            }
+            Text(value, Modifier.weight(if (showPower) 1.25f else .85f), style = style, textAlign = TextAlign.End)
             if (comparison) {
                 Text(
                     if (level == null) "ΔmV" else delta?.let { signed(it.toDouble(), 0) } ?: "—",

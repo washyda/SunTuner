@@ -791,6 +791,34 @@ static int edit_cdb_key7(const uint8_t *orig, size_t part_len, const cdt_parsed_
     return 0;
 }
 
+static int edit_stock_key7(const uint8_t *buf, size_t len, const cdt_parsed_t *parsed,
+                          uint8_t value, uint8_t *image) {
+    if (edit_cdb_key7(buf, len, parsed, value, image, 0) == 0) return 0;
+    if (parsed->version == 5 && !parsed->has_key7 && errno == ENOSPC) {
+        const size_t end = (size_t)parsed->descs[0].offset + parsed->descs[0].size;
+        for (int i = 1; i < parsed->block_count; i++) {
+            const cdt_desc_t *block = &parsed->descs[i];
+            if (block->size && block->offset >= end && block->offset < end + 2) {
+                return edit_cdb_key7(buf, len, parsed, value, image, 1);
+            }
+        }
+    }
+    return -1;
+}
+
+static const char *check_stock_layout(const uint8_t *buf, size_t len, const cdt_parsed_t *parsed) {
+    if (parsed->version >= 6) {
+        platform_hint_t hint = platform_from_cdt(parsed);
+        const char *check = read_firmware_template(&hint);
+        if (strcmp(check, "confirmed") != 0) return check;
+        if (hint.template_layout != parsed->layout) return "layout_mismatch";
+    }
+    if (parsed->version >= 5 && edit_stock_key7(buf, len, parsed, 1, NULL) != 0) {
+        return "no_space";
+    }
+    return "confirmed";
+}
+
 static int build_empty_cdt(uint8_t *image, const platform_hint_t *hint,
                            const cdb_layout_t *layout, uint8_t value) {
     const size_t offset = CDT_HEADER_SIZE + 4;
@@ -828,14 +856,15 @@ static int build_empty_cdt(uint8_t *image, const platform_hint_t *hint,
     return 0;
 }
 
-static int build_cdt_with_key7(
+static int build_cdt_image(
     const uint8_t *orig,
     size_t part_len,
     const cdt_parsed_t *parsed,
     const platform_hint_t *hint,
     int set_key7,
     uint8_t key7_value,
-    uint8_t **out_img
+    uint8_t **out_img,
+    int repack_v5
 ) {
     uint8_t *img = calloc(1, part_len);
     if (!img) return -1;
@@ -862,8 +891,8 @@ static int build_cdt_with_key7(
         return 0;
     }
 
-    if (set_key7 && parsed->version >= 6) {
-        if (edit_cdb_key7(orig, part_len, parsed, key7_value, img, 0) != 0) {
+    if (set_key7 && (parsed->version >= 6 || (parsed->version == 5 && !repack_v5))) {
+        if (edit_stock_key7(orig, part_len, parsed, key7_value, img) != 0) {
             free(img);
             return -1;
         }
@@ -958,6 +987,11 @@ static int build_cdt_with_key7(
     return 0;
 }
 
+static int build_cdt_with_key7(const uint8_t *orig, size_t len, const cdt_parsed_t *parsed,
+                              const platform_hint_t *hint, int set_key7, uint8_t value, uint8_t **image) {
+    return build_cdt_image(orig, len, parsed, hint, set_key7, value, image, 0);
+}
+
 static const char *disk_state_str(disk_state_t s) {
     switch (s) {
         case DISK_EMPTY: return "empty";
@@ -1029,6 +1063,13 @@ static const char *compare_backup(const uint8_t *backup, size_t backup_len,
             }
             uint8_t *expected = NULL;
             if (build_cdt_with_key7(backup, len, &parsed, &hint, 1, 1, &expected) == 0) {
+                int matches = memcmp(current, expected, len) == 0;
+                free(expected);
+                if (matches) return "enabled_match";
+            }
+            /* An older build could repack a v5 image when inserting Key 7. */
+            if (parsed.state == DISK_STOCK && parsed.version == 5 &&
+                build_cdt_image(backup, len, &parsed, &hint, 1, 1, &expected, 1) == 0) {
                 int matches = memcmp(current, expected, len) == 0;
                 free(expected);
                 if (matches) return "enabled_match";
@@ -1138,13 +1179,10 @@ static int cmd_status_with_hint(const char *dev_path, const char *backup_path, c
         source = "cdt";
         check = "confirmed";
         if (disk_state == DISK_STOCK) {
-            can_enable = 1;
+            check = check_stock_layout(buf, len, &parsed);
+            can_enable = strcmp(check, "confirmed") == 0;
             if (parsed.version >= 6) {
-                hint = platform_from_cdt(&parsed);
-                check = read_firmware_template(&hint);
                 source = "cdt_and_active_xbl_config";
-                if (hint.template_layout && hint.template_layout != layout) check = "layout_mismatch";
-                can_enable = hint.template_layout == layout && edit_cdb_key7(buf, len, &parsed, 1, NULL, 0) == 0;
                 printf("CDT_V6_CAN_ENABLE=%d\n", can_enable);
             }
         }
@@ -1202,10 +1240,8 @@ static int cmd_enable_with_hint(
     const char *check = "confirmed";
     if (parsed.state == DISK_EMPTY) {
         resolve_empty_cdt_hint(&detected, &check);
-    } else if (parsed.version >= 6) {
-        detected = platform_from_cdt(&parsed);
-        check = read_firmware_template(&detected);
-        if (detected.template_layout && detected.template_layout != parsed.layout) check = "layout_mismatch";
+    } else {
+        check = check_stock_layout(buf, len, &parsed);
     }
     if (strcmp(check, "confirmed") != 0) {
         free(buf);

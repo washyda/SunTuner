@@ -359,7 +359,7 @@ internal class RootBackend(private val context: Context) {
         val partition = if (outcome == CdtOutcome.UNKNOWN) null else reportOrNull(log) {
             parsePartition(traceCommand(listOf("cdt_status"), log))
         }
-        val plan = if (partition == null || partition.standalone) null else reportOrNull(log) {
+        val plan = if (partition == null) null else reportOrNull(log) {
             val report = traceCommand(listOf("read"), log)
             report.failure?.let { throw it }
             parsePlan(report.output)

@@ -260,8 +260,8 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
         }
         try {
             val plan = backend.read()
-            if (plan.sm8850) {
-                require(plan.bootId == cpu?.bootId) { "启动 ID 已改变，请刷新电压计划" }
+            if (cpu != null) {
+                require(plan.bootId == cpu.bootId) { "启动 ID 已改变，请刷新电压计划" }
             }
             updatePlan(plan)
             if (recoveryMessage != null) _state.update { it.copy(error = recoveryMessage) }
@@ -418,7 +418,7 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
             if (snapshot.benchmarkDevice != null) {
                 check(backend.readBenchmarkDevice() == cpu) { "设备频点或在线核心已变化，请刷新后重试" }
             }
-            if (plan != null) {
+            if (plan != null && !isSm8845) {
                 val current = backend.read()
                 updatePlan(current)
                 check(current.bootId == cpu.bootId && current.bootId == plan.bootId &&

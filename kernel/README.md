@@ -35,3 +35,14 @@ versions come from the exported-symbol CRCs in that revision's
 
 The controller recognizes the legacy internal module and driver names
 in the existing prebuilts. The ACD observer and PVC probe use SM8750 firmware addresses.
+
+For SM8845 on OPD2515 with the Android 15 GKI build based on
+[5d4cdf2ffe45](https://android.googlesource.com/kernel/common/+/5d4cdf2ffe45),
+the controller reuses only the 4 KB SCMI reader from the SM8750 directory.
+The SCMI protocol headers and all imported symbol CRCs match that kernel.
+On OPD2515 firmware 17.0.1.201, PDP computes SCMI power in µW as
+`floor(C × frequency_kHz × voltage_mV² / 1,000,000,000)`.
+The internal CDB entry `K_DMIPS_HZ` supplies `C = 100` for PDP0 and
+`C = 150` for PDP1. The app reverses the formula on the 4 mV grid
+and shows estimated voltage only when every row reproduces its original
+SCMI power. Otherwise it shows the raw plan frequency and estimated power.
