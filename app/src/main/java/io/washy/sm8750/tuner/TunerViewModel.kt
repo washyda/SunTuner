@@ -44,7 +44,7 @@ internal data class ScreenState(
     val hasCdtFailureLog: Boolean = false,
     val cdtLogExportComplete: Boolean = false,
     val compatibilityReport: CompatibilityReport? = null,
-    val diagnosticsSaved: Boolean = false,
+    val diagnosticMissingFiles: Int? = null,
     val cdtBackupResult: CdtBackupResult? = null,
     val rebootPrompt: RebootPrompt? = null,
     val pendingRestoreNoBackup: Boolean = false,
@@ -265,20 +265,20 @@ internal class TunerViewModel(app: Application) : AndroidViewModel(app) {
 
     fun checkCompatibility() = launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在检测兼容性…") {
         val report = backend.collectDiagnostics()
-        _state.update { it.copy(compatibilityReport = report, diagnosticsSaved = false) }
+        _state.update { it.copy(compatibilityReport = report, diagnosticMissingFiles = null) }
     }
 
     fun exportDiagnostics(destination: Uri) {
         val report = _state.value.compatibilityReport ?: return
-        launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在保存检测日志…") {
-            _state.update { it.copy(diagnosticsSaved = false) }
-            backend.exportDiagnostics(destination, report)
-            _state.update { it.copy(diagnosticsSaved = true) }
+        launchOperation(Operation.EXPORTING_DIAGNOSTICS, "正在保存兼容性包…") {
+            _state.update { it.copy(diagnosticMissingFiles = null) }
+            val missingFiles = backend.exportDiagnostics(destination, report)
+            _state.update { it.copy(diagnosticMissingFiles = missingFiles) }
         }
     }
 
     fun dismissDiagnosticsResult() = _state.update {
-        if (it.operation != null) it else it.copy(compatibilityReport = null, diagnosticsSaved = false, error = null)
+        if (it.operation != null) it else it.copy(compatibilityReport = null, diagnosticMissingFiles = null, error = null)
     }
 
     fun exportCdtFailureLog(destination: Uri) =

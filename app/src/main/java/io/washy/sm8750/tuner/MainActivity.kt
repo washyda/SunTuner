@@ -64,7 +64,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val state by model.state.collectAsStateWithLifecycle()
             val diagnosticsPicker = rememberLauncherForActivityResult(
-                ActivityResultContracts.CreateDocument("text/plain"),
+                ActivityResultContracts.CreateDocument("application/zip"),
             ) { uri -> uri?.let(model::exportDiagnostics) }
             val cdtLogPicker = rememberLauncherForActivityResult(
                 ActivityResultContracts.CreateDocument("text/plain"),
@@ -91,7 +91,7 @@ class MainActivity : ComponentActivity() {
                     onCheckCompatibility = model::checkCompatibility,
                     onExportDiagnostics = {
                         val modelName = android.os.Build.MODEL.replace(Regex("[^A-Za-z0-9_-]"), "_").take(40)
-                        diagnosticsPicker.launch("SunTuner-$modelName-diagnostics.txt")
+                        diagnosticsPicker.launch("SunTuner-$modelName-diagnostics.zip")
                     },
                     onDismissDiagnosticsResult = model::dismissDiagnosticsResult,
                     onExportCdtFailureLog = {
@@ -174,7 +174,7 @@ private fun TunerApp(
         CompatibilityScreen(
             report = report,
             saving = state.operation != null,
-            saved = state.diagnosticsSaved,
+            missingFiles = state.diagnosticMissingFiles,
             error = state.error,
             onSave = onExportDiagnostics,
             onBack = onDismissDiagnosticsResult,

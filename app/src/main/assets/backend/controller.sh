@@ -19,15 +19,18 @@ owned_observer=0
 
 die() { printf 'ERROR %s\n' "$*" >&2; exit 1; }
 
-find_cdt_dev() {
-    for p in /dev/block/by-name/cdt /dev/block/bootdevice/by-name/cdt; do
-        if [ -e "$p" ]; then
-            printf '%s\n' "$p"
+find_partition_dev() {
+    local path
+    for path in "/dev/block/by-name/$1" "/dev/block/bootdevice/by-name/$1"; do
+        if [ -e "$path" ]; then
+            printf '%s\n' "$path"
             return 0
         fi
     done
     return 1
 }
+
+find_cdt_dev() { find_partition_dev cdt; }
 
 restore_governors() {
     local journal="$session/stress-governors" policy previous file current failed=0
@@ -797,15 +800,60 @@ read_sm8850_perf() {
     return "$result"
 }
 
+diagnostic_slot_suffix() {
+    local slot
+    slot=$(getprop ro.boot.slot_suffix)
+    if [ -z "$slot" ]; then
+        case "$(getprop ro.boot.slot)" in
+            a) slot=_a ;;
+            b) slot=_b ;;
+        esac
+    fi
+    case "$slot" in
+        _a|_b) printf '%s\n' "$slot" ;;
+        *) return 1 ;;
+    esac
+}
+
+read_diagnostic_file() {
+    local name=$1 expected_slot=$2 slot source size max
+    case "$name" in
+        uefi|xbl|xbl_config)
+            slot=$(diagnostic_slot_suffix) || die "无法确认活动槽位"
+            [ "$slot" = "$expected_slot" ] || die "活动槽位已变化，请重新检测"
+            source=$(find_partition_dev "$name$slot") || die "未找到 $name$slot 分区"
+            [ -b "$source" ] || die "$name$slot 不是块设备"
+            size=$(blockdev --getsize64 "$source") || die "无法获取 $name$slot 分区大小"
+            max=67108864 ;;
+        config.gz)
+            source=/proc/config.gz
+            [ -r "$source" ] || die "内核未提供可读的 /proc/config.gz"
+            size=$(wc -c < "$source") || die "无法读取内核配置大小"
+            size=$(printf '%s' "$size" | tr -d '[:space:]')
+            max=4194304 ;;
+        *) die "未知诊断文件" ;;
+    esac
+    case "$size" in ''|*[!0-9]*) die "文件大小无效" ;; esac
+    [ "$size" -gt 0 ] && [ "$size" -le "$max" ] || die "文件大小超出采集范围"
+    printf 'SIZE %s\n' "$size" >&2
+    exec head -c "$size" "$source"
+}
+
 collect_diagnostics() {
     local cdt_dev path prop value attribute policy
     local cdt_block= cdt_parent= cdt_sysfs= parent_sysfs=
     printf '[boot and kernel]\n'
+    printf 'DIAGNOSTIC_BOOT_ID=%s\n' "$(cat "$boot_file" 2>/dev/null || true)"
+    printf 'DIAGNOSTIC_SLOT=%s\n' "$(diagnostic_slot_suffix || printf unknown)"
     printf 'KERNEL_RELEASE=%s\n' "$(uname -r)"
     printf 'KERNEL_PAGE_SIZE=%s\n' "$(kernel_page_size 2>/dev/null || printf unknown)"
     for prop in ro.boot.slot_suffix ro.boot.slot ro.boot.hardware ro.product.vendor.device         ro.vendor.build.fingerprint ro.soc.manufacturer ro.soc.model; do
         value=$(getprop "$prop")
         [ -z "$value" ] || printf '%s=%s\n' "$prop" "$value"
+    done
+    for attribute in hw_platform platform_version platform_subtype_id; do
+        value=$(cat "/sys/devices/soc0/$attribute" 2>/dev/null) || value=
+        printf '%s=%s\n' "$attribute" "${value:-unavailable}"
     done
 
     printf '\n[cdt partition]\n'
@@ -936,6 +984,14 @@ if [ "$action" = diagnostics ]; then
         read_sm8850_perf || true
     fi
     exit 0
+fi
+
+if [ "$action" = diagnostic_file ]; then
+    [ "$#" = 3 ] || die "诊断文件参数无效"
+    [ "$(id -u)" = 0 ] || die "需要 Root 权限"
+    boot=$(cat "$boot_file") || die "无法确认启动 ID"
+    [ -n "$boot" ] && [ "$1" = "$boot" ] || die "设备已重启，请重新检测"
+    read_diagnostic_file "$2" "$3"
 fi
 
 cdt_stage check_firmware

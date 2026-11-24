@@ -9,10 +9,14 @@ import android.util.AtomicFile
 import android.util.Base64
 import java.io.File
 import java.io.OutputStream
+import java.nio.file.Files
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 
 internal class LoadControl {
@@ -180,10 +184,70 @@ internal class RootBackend(private val context: Context) {
     }
 
     suspend fun exportDiagnostics(destination: Uri, report: CompatibilityReport) = withContext(Dispatchers.IO) {
-        val output = context.contentResolver.openOutputStream(destination, "wt")
-            ?: error("无法打开诊断报告")
-        output.bufferedWriter(Charsets.UTF_8).use { it.write(report.text) }
+        val work = Files.createTempDirectory(context.cacheDir.toPath(), "diagnostics-").toFile()
+        try {
+            val archive = File(work, "diagnostics.zip")
+            val staged = File(work, "entry")
+            val slot = report.slotSuffix.orEmpty()
+            val bootId = report.bootId
+            var missingFiles = 0
+            ZipOutputStream(archive.outputStream().buffered()).use { zip ->
+                val inventory = StringBuilder("\n[diagnostic archive]\n")
+                for (name in listOf("uefi", "xbl", "xbl_config", "config.gz")) {
+                    val isFirmware = name != "config.gz"
+                    val entryName = if (isFirmware) "$name$slot.img" else name
+                    val unavailable = when {
+                        bootId == null -> "未采集 Root 启动信息"
+                        isFirmware && slot.isEmpty() -> "无法确认活动槽位"
+                        else -> try {
+                            readDiagnosticFile(bootId, name, slot, staged)
+                            null
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            e.message?.lineSequence()?.firstOrNull()?.take(180) ?: "读取失败"
+                        }
+                    }
+                    if (unavailable == null) {
+                        zip.putNextEntry(ZipEntry(entryName))
+                        staged.inputStream().use { it.copyTo(zip) }
+                        zip.closeEntry()
+                        inventory.appendLine("$entryName=collected (${staged.length()} bytes)")
+                    } else {
+                        missingFiles++
+                        inventory.appendLine("$entryName=unavailable ($unavailable)")
+                    }
+                }
+                zip.putNextEntry(ZipEntry("diagnostics.txt"))
+                zip.write((report.text + inventory).encodeToByteArray())
+                zip.closeEntry()
+            }
+            val output = context.contentResolver.openOutputStream(destination, "wt")
+                ?: error("无法打开兼容性包保存位置")
+            output.use { stream -> archive.inputStream().use { it.copyTo(stream) } }
+            missingFiles
+        } finally {
+            work.deleteRecursively()
+        }
     }
+
+    private suspend fun readDiagnosticFile(bootId: String, name: String, slot: String, destination: File) =
+        runInterruptible(Dispatchers.IO) {
+            val process = startRootCommand(listOf("diagnostic_file", bootId, name, slot), destination)
+            try {
+                process.outputStream.close()
+                val report = process.errorStream.bufferedReader().use { it.readText() }
+                check(process.waitFor() == 0) {
+                    report.lineSequence().firstOrNull { it.startsWith("ERROR ") }?.removePrefix("ERROR ")
+                        ?: "Root 读取失败"
+                }
+                val size = report.lineSequence().singleOrNull { it.startsWith("SIZE ") }
+                    ?.removePrefix("SIZE ")?.toLongOrNull()
+                check(size != null && size > 0 && destination.length() == size) { "文件读取不完整" }
+            } finally {
+                process.destroy()
+            }
+        }
 
     suspend fun enableCdt(bootId: String): CdtOperationResult =
         cdtCommand(listOf("cdt_enable", bootId))
@@ -401,14 +465,7 @@ internal class RootBackend(private val context: Context) {
         onLine: (String) -> Unit = {},
         onExit: (Int) -> Unit = {},
     ): String = withContext(Dispatchers.IO) {
-        val command = listOf("/system/bin/sh", File(bundle, "controller.sh").path, bundle.path) + args
-        val process = try {
-            ProcessBuilder("su", "-c", command.joinToString(" ") { shellQuote(it) })
-                .redirectErrorStream(true)
-                .start()
-        } catch (e: java.io.IOException) {
-            throw IllegalStateException("找不到可用的 su，请在 Root 管理器中授权此应用", e)
-        }
+        val process = startRootCommand(args)
         try {
             if (control == null) process.outputStream.close() else control.attach(process.outputStream)
             val output = process.inputStream.bufferedReader().use { reader ->
@@ -436,6 +493,17 @@ internal class RootBackend(private val context: Context) {
         } finally {
             control?.detach()
             runCatching { process.outputStream.close() }
+        }
+    }
+
+    private fun startRootCommand(args: List<String>, output: File? = null): Process {
+        val command = listOf("/system/bin/sh", File(bundle, "controller.sh").path, bundle.path) + args
+        val builder = ProcessBuilder("su", "-c", command.joinToString(" ") { shellQuote(it) })
+        if (output == null) builder.redirectErrorStream(true) else builder.redirectOutput(output)
+        return try {
+            builder.start()
+        } catch (e: java.io.IOException) {
+            throw IllegalStateException("无法启动 Root 后端，请检查 Root 授权", e)
         }
     }
 

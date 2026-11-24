@@ -30,7 +30,7 @@ import io.washy.sm8750.tuner.CompatibilityReport
 internal fun CompatibilityScreen(
     report: CompatibilityReport,
     saving: Boolean,
-    saved: Boolean,
+    missingFiles: Int?,
     error: String?,
     onSave: () -> Unit,
     onBack: () -> Unit,
@@ -53,11 +53,15 @@ internal fun CompatibilityScreen(
                 ) {
                     if (error != null) {
                         Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                    } else if (saved) {
-                        Text("检测日志已保存", style = MaterialTheme.typography.bodySmall)
+                    } else if (missingFiles != null) {
+                        Text(
+                            if (missingFiles == 0) "兼容性包已保存"
+                            else "兼容性包已保存，有 ${missingFiles} 项未采集。详情见 diagnostics.txt。",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
                     Button(onClick = onSave, enabled = !saving, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (saving) "正在保存…" else "保存检测日志")
+                        Text(if (saving) "正在保存…" else "保存兼容性包")
                     }
                 }
             }
@@ -117,6 +121,12 @@ internal fun CompatibilityScreen(
                         } else {
                             Text("已保留机型和内核信息。检查 Root 授权后可重新检测。", style = MaterialTheme.typography.bodySmall)
                         }
+                        if (report.rootCollected) {
+                            Text(
+                                "保存时会采集活动槽的 uefi、xbl、xbl_config 和可读的内核配置。",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
                     }
                 }
             }
@@ -146,7 +156,7 @@ private fun CompatibilityScreenPreview() {
                 "CDT_DISK=stock\nCDT_BLOCKDEV_RO=0\nSCMI_BUS=present\nSELINUX_MODE=Enforcing\n",
             ),
             saving = false,
-            saved = false,
+            missingFiles = null,
             error = null,
             onSave = {},
             onBack = {},

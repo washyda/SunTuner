@@ -18,6 +18,8 @@ internal class CompatibilityReport(
 
     val model = text.lineSequence().firstOrNull { it.startsWith("MODEL=") }?.substringAfter('=').orEmpty()
     val kernel = text.lineSequence().firstOrNull { it.startsWith("KERNEL=") }?.substringAfter('=').orEmpty()
+    val bootId = rootValues["DIAGNOSTIC_BOOT_ID"]?.takeIf { it.isNotBlank() }
+    val slotSuffix = rootValues["DIAGNOSTIC_SLOT"]?.takeIf { it == "_a" || it == "_b" }
     val cdtDisk = rootValues["CDT_DISK"]
     val cdtRead = rootValues["CDT_READ"]
     val recoveryPending = rootValues["CDT_TRANSACTION"] == "pending_recovery"
