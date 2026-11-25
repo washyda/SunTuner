@@ -1,5 +1,7 @@
 package io.washy.sm8750.tuner
 
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.os.Bundle
 import android.view.WindowManager
 import android.widget.Toast
@@ -56,7 +58,10 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.edit
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import io.washy.sm8750.tuner.ui.BenchmarkScreen
 import io.washy.sm8750.tuner.ui.CompatibilityScreen
 import io.washy.sm8750.tuner.ui.CrashLogScreen
@@ -67,6 +72,8 @@ import io.washy.sm8750.tuner.ui.ThemeMode
 import io.washy.sm8750.tuner.ui.TunerTheme
 import io.washy.sm8750.tuner.ui.TunerThemeTokens
 import io.washy.sm8750.tuner.ui.VoltageScreen
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val model by lazy { ViewModelProvider(this)[TunerViewModel::class.java] }
@@ -76,6 +83,25 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                updates.pending.collectLatest { download ->
+                    if (download == null) return@collectLatest
+                    val apk = updates.awaitInstaller(download) ?: return@collectLatest
+                    if (!updates.markInstallerOffered(download)) return@collectLatest
+                    try {
+                        startActivity(Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(apk, APK_MIME_TYPE)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        })
+                    } catch (_: ActivityNotFoundException) {
+                        Toast.makeText(this@MainActivity, "无法打开系统安装页", Toast.LENGTH_SHORT).show()
+                    } catch (_: SecurityException) {
+                        Toast.makeText(this@MainActivity, "无法打开系统安装页", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
         setContent {
             val preferences = remember { getSharedPreferences("appearance", MODE_PRIVATE) }
             var themeMode by remember {
@@ -179,7 +205,7 @@ class MainActivity : ComponentActivity() {
                             updateState = updateState,
                             onCheckUpdate = { updates.check(installedVersion) },
                             onDismissUpdate = updates::dismiss,
-                            onDownloadUpdate = { updates.download(applicationContext, it) },
+                            onDownloadUpdate = updates::download,
                             onOpenUrl = { url ->
                                 try {
                                     uriHandler.openUri(url)
