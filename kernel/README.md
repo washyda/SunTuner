@@ -42,7 +42,10 @@ the controller reuses only the 4 KB SCMI reader from the SM8750 directory.
 The SCMI protocol headers and all imported symbol CRCs match that kernel.
 On OPD2515 firmware 17.0.1.201, PDP computes SCMI power in µW as
 `floor(C × frequency_kHz × voltage_mV² / 1,000,000,000)`.
-The internal CDB entry `K_DMIPS_HZ` supplies `C = 100` for PDP0 and
-`C = 150` for PDP1. The app reverses the formula on the 4 mV grid
-and shows estimated voltage only when every row reproduces its original
-SCMI power. Otherwise it shows the raw plan frequency and estimated power.
+The internal CDB entry `K_DMIPS_HZ` in that image supplies `C = 100` for
+PDP0 and `C = 150` for PDP1. An OPD2515 capture with build fingerprint
+`B.390ad9a-1281655-12dd9f7` instead matches `100 / 136` across all 32 rows.
+The app reverses both supported models on the 4 mV grid and uses the
+unique model that reproduces every original SCMI power value. If no
+unique model matches, it shows frequency and estimated power. A stored
+baseline must also pass using the current model.

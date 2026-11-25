@@ -2,6 +2,7 @@ package io.washy.sm8750.tuner
 
 import android.os.Bundle
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -29,8 +30,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -42,27 +46,59 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.core.content.edit
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.washy.sm8750.tuner.ui.BenchmarkScreen
 import io.washy.sm8750.tuner.ui.CompatibilityScreen
 import io.washy.sm8750.tuner.ui.CrashLogScreen
 import io.washy.sm8750.tuner.ui.ExpressiveLoadingIndicator
+import io.washy.sm8750.tuner.ui.SettingsScreen
+import io.washy.sm8750.tuner.ui.ThemeAccent
+import io.washy.sm8750.tuner.ui.ThemeMode
 import io.washy.sm8750.tuner.ui.TunerTheme
 import io.washy.sm8750.tuner.ui.TunerThemeTokens
 import io.washy.sm8750.tuner.ui.VoltageScreen
 
 class MainActivity : ComponentActivity() {
     private val model by lazy { ViewModelProvider(this)[TunerViewModel::class.java] }
+    private val updates by lazy { ViewModelProvider(this)[AppUpdatesViewModel::class.java] }
+    private val installedVersion by lazy { packageManager.getPackageInfo(packageName, 0).versionName.orEmpty() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
+            val preferences = remember { getSharedPreferences("appearance", MODE_PRIVATE) }
+            var themeMode by remember {
+                val name = preferences.getString("theme_mode", null)
+                mutableStateOf(ThemeMode.entries.firstOrNull { it.name == name } ?: ThemeMode.SYSTEM)
+            }
+            var accent by remember {
+                val name = preferences.getString("theme_accent", null)
+                mutableStateOf(ThemeAccent.entries.firstOrNull { it.name == name } ?: ThemeAccent.INDIGO)
+            }
+            val dark = themeMode.isDark()
+            SideEffect {
+                val bars = WindowCompat.getInsetsController(window, window.decorView)
+                bars.isAppearanceLightStatusBars = !dark
+                bars.isAppearanceLightNavigationBars = !dark
+            }
             val state by model.state.collectAsStateWithLifecycle()
+            val updateState by updates.state.collectAsStateWithLifecycle()
+            LaunchedEffect(updateState) {
+                val message = updateState as? UpdateState.Message ?: return@LaunchedEffect
+                Toast.makeText(this@MainActivity, message.text, Toast.LENGTH_SHORT).show()
+                updates.dismiss(message)
+            }
             val diagnosticsPicker = rememberLauncherForActivityResult(
                 ActivityResultContracts.CreateDocument("application/zip"),
             ) { uri -> uri?.let(model::exportDiagnostics) }
@@ -84,7 +120,7 @@ class MainActivity : ComponentActivity() {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
             }
-            TunerTheme {
+            TunerTheme(dark = dark, accent = accent) {
                 TunerApp(
                     state = state,
                     onRefresh = model::refresh,
@@ -125,6 +161,34 @@ class MainActivity : ComponentActivity() {
                         LaunchedEffect(Unit) { model.refreshCrashLogs() }
                         CrashLogScreen(logs, model::refreshCrashLogs, model::deleteCrashLogs, model::exportCrashLog)
                     },
+                    settingsContent = {
+                        val uriHandler = LocalUriHandler.current
+                        SettingsScreen(
+                            themeMode = themeMode,
+                            accent = accent,
+                            dark = dark,
+                            onThemeModeChange = {
+                                themeMode = it
+                                preferences.edit { putString("theme_mode", it.name) }
+                            },
+                            onAccentChange = {
+                                accent = it
+                                preferences.edit { putString("theme_accent", it.name) }
+                            },
+                            versionName = installedVersion,
+                            updateState = updateState,
+                            onCheckUpdate = { updates.check(installedVersion) },
+                            onDismissUpdate = updates::dismiss,
+                            onDownloadUpdate = { updates.download(applicationContext, it) },
+                            onOpenUrl = { url ->
+                                try {
+                                    uriHandler.openUri(url)
+                                } catch (_: IllegalArgumentException) {
+                                    Toast.makeText(this@MainActivity, "无法打开链接", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                        )
+                    },
                 )
             }
         }
@@ -164,6 +228,7 @@ private fun TunerApp(
     onStart: () -> Unit,
     onStop: () -> Unit,
     crashLogContent: @Composable () -> Unit = {},
+    settingsContent: @Composable () -> Unit = {},
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
 
@@ -238,26 +303,38 @@ private fun TunerApp(
                 NavigationBarItem(
                     selected = tab == 0,
                     onClick = { tab = 0 },
-                    icon = { VoltageNavIcon() },
+                    alwaysShowLabel = false,
+                    icon = { NavIcon("电压") { VoltageNavIcon() } },
                     label = { Text("电压") },
                 )
                 NavigationBarItem(
                     selected = tab == 1,
                     onClick = { tab = 1 },
-                    icon = { BenchmarkNavIcon() },
+                    alwaysShowLabel = false,
+                    icon = { NavIcon("烤机") { BenchmarkNavIcon() } },
                     label = { Text("烤机") },
                 )
                 NavigationBarItem(
                     selected = tab == 2,
                     onClick = { tab = 2 },
-                    icon = { CrashLogNavIcon() },
+                    alwaysShowLabel = false,
+                    icon = { NavIcon("日志") { CrashLogNavIcon() } },
                     label = { Text("日志") },
+                )
+                NavigationBarItem(
+                    selected = tab == 3,
+                    onClick = { tab = 3 },
+                    alwaysShowLabel = false,
+                    icon = { NavIcon("设置") { SettingsNavIcon() } },
+                    label = { Text("设置") },
                 )
             }
         },
     ) { padding ->
-        if (tab == 2) {
-            Box(Modifier.fillMaxSize().padding(padding)) { crashLogContent() }
+        if (tab == 2 || tab == 3) {
+            Box(Modifier.fillMaxSize().padding(padding)) {
+                if (tab == 2) crashLogContent() else settingsContent()
+            }
             return@Scaffold
         }
         Box(Modifier.fillMaxSize().padding(padding)) {
@@ -409,6 +486,26 @@ private fun CrashLogNavIcon() {
         )
         for (row in listOf(0.36f, 0.50f, 0.64f)) {
             drawLine(tint, Offset(w * 0.37f, h * row), Offset(w * 0.63f, h * row), w * 0.07f, StrokeCap.Round)
+        }
+    }
+}
+
+@Composable
+private fun NavIcon(label: String, icon: @Composable () -> Unit) {
+    Box(Modifier.semantics { contentDescription = label }) { icon() }
+}
+
+@Composable
+private fun SettingsNavIcon() {
+    val tint = LocalContentColor.current
+    Canvas(Modifier.size(22.dp)) {
+        val stroke = size.width * 0.08f
+        drawCircle(tint, size.width * 0.30f, style = Stroke(stroke))
+        drawCircle(tint, size.width * 0.10f, style = Stroke(stroke))
+        repeat(8) { tooth ->
+            rotate(tooth * 45f) {
+                drawLine(tint, Offset(center.x, size.height * 0.08f), Offset(center.x, size.height * 0.20f), stroke, StrokeCap.Round)
+            }
         }
     }
 }

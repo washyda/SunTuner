@@ -252,27 +252,6 @@ internal fun MetricTile(
     }
 }
 
-@Composable
-internal fun KeyValuePill(label: String, value: String, tone: Tone = Tone.NEUTRAL, modifier: Modifier = Modifier) {
-    val (_, accent) = toneColors(tone)
-    Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-    ) {
-        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(
-                value,
-                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold).tabular(),
-                color = if (tone == Tone.NEUTRAL) MaterialTheme.colorScheme.onSurface else accent,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}
-
 internal fun planStateTag(state: PlanState): Pair<String, Tone> = when (state) {
     PlanState.STOCK_UNMODIFIED -> "原厂 CDT" to Tone.NEUTRAL
     PlanState.CDT_WRITTEN -> "CDT 已写入" to Tone.POSITIVE

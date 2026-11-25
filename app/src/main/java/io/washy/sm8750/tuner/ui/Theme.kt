@@ -2,6 +2,7 @@ package io.washy.sm8750.tuner.ui
 
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
@@ -19,7 +20,6 @@ import androidx.compose.ui.unit.dp
 @Immutable
 internal data class TunerExtendedColors(
     val positive: Color,
-    val onPositive: Color,
     val positiveContainer: Color,
     val warning: Color,
     val warningContainer: Color,
@@ -31,7 +31,6 @@ internal data class TunerExtendedColors(
 
 private val LightExtended = TunerExtendedColors(
     positive = Color(0xFF136F46),
-    onPositive = Color.White,
     positiveContainer = Color(0xFFD6F5E3),
     warning = Color(0xFF9A5000),
     warningContainer = Color(0xFFFFE8CC),
@@ -43,7 +42,6 @@ private val LightExtended = TunerExtendedColors(
 
 private val DarkExtended = TunerExtendedColors(
     positive = Color(0xFF7BE0A8),
-    onPositive = Color(0xFF063922),
     positiveContainer = Color(0xFF144B32),
     warning = Color(0xFFFFC168),
     warningContainer = Color(0xFF4F3200),
@@ -61,6 +59,49 @@ internal object TunerThemeTokens {
 }
 
 internal fun TextStyle.tabular(): TextStyle = copy(fontFeatureSettings = "tnum")
+
+internal enum class ThemeMode(val label: String) {
+    SYSTEM("跟随系统"), LIGHT("浅色"), DARK("深色");
+
+    @Composable
+    fun isDark(): Boolean = when (this) {
+        SYSTEM -> isSystemInDarkTheme()
+        LIGHT -> false
+        DARK -> true
+    }
+}
+
+internal enum class ThemeAccent(
+    val label: String,
+    private val lightPrimary: Color,
+    private val darkPrimary: Color,
+    private val lightContainer: Color,
+    private val darkContainer: Color,
+) {
+    INDIGO("靛蓝", Color(0xFF4858CE), Color(0xFFBDC4FF), Color(0xFFDDE1FF), Color(0xFF303B83)),
+    TEAL("青绿", Color(0xFF006A60), Color(0xFF80D5C6), Color(0xFF9CF2E2), Color(0xFF005047)),
+    ROSE("玫红", Color(0xFF944B68), Color(0xFFFFB0CE), Color(0xFFFFD9E5), Color(0xFF76334F)),
+    AMBER("琥珀", Color(0xFF775900), Color(0xFFF1C04C), Color(0xFFFFDF93), Color(0xFF5B4300));
+
+    fun swatch(dark: Boolean): Color = if (dark) darkPrimary else lightPrimary
+
+    fun applyTo(scheme: ColorScheme, dark: Boolean): ColorScheme {
+        if (this == INDIGO) return scheme
+        val primary = swatch(dark)
+        val container = if (dark) darkContainer else lightContainer
+        val onContainer = if (dark) lightContainer else darkContainer
+        return scheme.copy(
+            primary = primary,
+            onPrimary = if (dark) darkContainer else Color.White,
+            primaryContainer = container,
+            onPrimaryContainer = onContainer,
+            inversePrimary = swatch(!dark),
+            secondaryContainer = container,
+            onSecondaryContainer = onContainer,
+            surfaceTint = primary,
+        )
+    }
+}
 
 private val LightScheme = lightColorScheme(
     primary = Color(0xFF4858CE),
@@ -121,11 +162,14 @@ private val TunerTypography = Typography(
 )
 
 @Composable
-internal fun TunerTheme(content: @Composable () -> Unit) {
-    val dark = isSystemInDarkTheme()
+internal fun TunerTheme(
+    dark: Boolean = isSystemInDarkTheme(),
+    accent: ThemeAccent = ThemeAccent.INDIGO,
+    content: @Composable () -> Unit,
+) {
     CompositionLocalProvider(LocalExtendedColors provides if (dark) DarkExtended else LightExtended) {
         MaterialTheme(
-            colorScheme = if (dark) DarkScheme else LightScheme,
+            colorScheme = accent.applyTo(if (dark) DarkScheme else LightScheme, dark),
             shapes = TunerShapes,
             typography = TunerTypography,
             content = content,

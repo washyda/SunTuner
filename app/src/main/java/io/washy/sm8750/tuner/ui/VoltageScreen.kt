@@ -17,11 +17,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -45,12 +45,13 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
 import io.washy.sm8750.tuner.BaselineSource
-import io.washy.sm8750.tuner.CdtPartition
 import io.washy.sm8750.tuner.DevicePlan
 import io.washy.sm8750.tuner.Level
 import io.washy.sm8750.tuner.Operation
@@ -141,6 +142,7 @@ internal fun VoltageScreen(
             VoltageTable(domain, levels.sortedByDescending(Level::khz), baseline)
         }
     }
+    val tableLayouts = rememberVoltageTableLayouts(tables, showPower)
     Column(modifier.fillMaxSize()) {
         ScreenHeading("电压计划") {
             TonalAction(
@@ -172,7 +174,10 @@ internal fun VoltageScreen(
         BoxWithConstraints(
             modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
         ) {
-            val columnCount = if (maxWidth.value >= 326 * LocalDensity.current.fontScale) 2 else 1
+            val clusterSpacing = with(LocalDensity.current) { VoltageClusterSpacing.roundToPx() }
+            val contentWidth = constraints.maxWidth
+            val twoColumnWidth = (contentWidth - clusterSpacing) / 2
+            val columnCount = if (tableLayouts.all { it.compactWidth <= twoColumnWidth }) 2 else 1
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(vertical = 6.dp),
@@ -212,42 +217,26 @@ internal fun VoltageScreen(
                         )
                     }
                 }
-                for (group in tables.chunked(columnCount)) {
+                for (group in tableLayouts.chunked(columnCount)) {
                     val key = group.joinToString("_") { it.domain.toString() }
-                    item(key = "header_$key") {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    val tableWidth = if (group.size == 2) twoColumnWidth else contentWidth
+                    val compact = group.any { it.fullWidth > tableWidth }
+                    items(
+                        count = group.maxOf { it.rows.size },
+                        key = { row -> if (row == 0) "header_$key" else "level_${key}_${row - 1}" },
+                    ) { row ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(VoltageClusterSpacing)) {
                             for (table in group) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        "PDP${table.domain}",
-                                        Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
-                                        color = voltageClusterColor(table.domain),
-                                        style = MaterialTheme.typography.titleSmall,
-                                    )
-                                    VoltageTableRow(
-                                        comparison = table.baseline.isNotEmpty(),
-                                        showPower = showPower,
-                                        shapeCount = table.levels.size + 1,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                    items(group.maxOf { it.levels.size }, key = { row -> "level_${key}_$row" }) { row ->
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            for (table in group) {
-                                val level = table.levels.getOrNull(row)
-                                if (level == null) {
+                                val values = table.rows.getOrNull(row)
+                                if (values == null) {
                                     Spacer(Modifier.weight(1f))
                                 } else {
                                     VoltageTableRow(
-                                        comparison = table.baseline.isNotEmpty(),
-                                        showPower = showPower,
+                                        table = table,
+                                        values = values,
+                                        row = row,
+                                        compact = compact,
                                         modifier = Modifier.weight(1f),
-                                        level = level,
-                                        original = table.baseline[level.khz]?.millivolts,
-                                        shapeIndex = row + 1,
-                                        shapeCount = table.levels.size + 1,
                                     )
                                 }
                             }
@@ -334,15 +323,54 @@ private fun CdtToolbar(
     }
 }
 
-@Preview(showBackground = true)
+@Preview(name = "Two columns", widthDp = 360, heightDp = 760, showBackground = true)
+@Preview(name = "High DPI", widthDp = 270, heightDp = 600, showBackground = true)
+@Preview(name = "Large text", widthDp = 200, heightDp = 650, fontScale = 2f, showBackground = true)
+@Preview(name = "Dark", widthDp = 360, uiMode = Configuration.UI_MODE_NIGHT_YES, showBackground = true)
 @Composable
-private fun VoltageScreenPreview() {
+private fun VoltageScreenPreview() = VoltageScreenPreviewContent(showPower = false)
+
+@Preview(name = "High DPI power table", widthDp = 270, heightDp = 600, showBackground = true)
+@Composable
+private fun VoltagePowerScreenPreview() = VoltageScreenPreviewContent(showPower = true)
+
+@Composable
+private fun VoltageScreenPreviewContent(showPower: Boolean) {
+    fun levels(offsetMv: Int) = (0..1).flatMap { domain ->
+        (0..4).map { index ->
+            val khz = 600_000 + domain * 500_000 + index * (850_000 + domain * 50_000)
+            val mv = 584 + domain * 40 + index * 96 + offsetMv
+            val power = (100L * khz * mv * mv / 1_000_000_000).toInt()
+            Level(domain, index, khz, power, if (showPower) null else 100)
+        }
+    }
+    val state = ScreenState(
+        plan = DevicePlan(
+            bootId = "preview",
+            state = PlanState.CDT_WRITTEN,
+            cdtDisk = "slt_enabled",
+            cdtKey7 = "enabled",
+            hasCdtBackup = true,
+            cdtPlatform = "",
+            bootCdt = "",
+            bootPlatformInfo = "",
+            apnsSlot = "",
+            baselineSource = if (showPower) BaselineSource.NONE else BaselineSource.PERSISTED,
+            online = (0..7).toSet(),
+            baseline = if (showPower) null else levels(24),
+            current = levels(0),
+            estimatedScmiVoltage = !showPower,
+        ),
+    )
     TunerTheme {
-        VoltageScreen(
-            state = ScreenState(cdtPartition = CdtPartition("preview", "slt_enabled", "enabled_match")),
-            onRefresh = {}, onCheckCompatibility = {}, onBackupCdt = {}, onEnableCdt = {}, onRestoreCdt = {},
-            onRestoreCdtFromFile = {}, onRebootNow = {},
-        )
+        Scaffold { padding ->
+            VoltageScreen(
+                state = state,
+                onRefresh = {}, onCheckCompatibility = {}, onBackupCdt = {}, onEnableCdt = {}, onRestoreCdt = {},
+                onRestoreCdtFromFile = {}, onRebootNow = {},
+                modifier = Modifier.padding(padding),
+            )
+        }
     }
 }
 
@@ -499,72 +527,160 @@ private fun ChartLegend(label: String, tint: Color, dashed: Boolean) {
     }
 }
 
-@Preview(widthDp = 360, showBackground = true)
-@Preview(widthDp = 360, uiMode = Configuration.UI_MODE_NIGHT_YES, showBackground = true)
-@Composable
-private fun CombinedVoltageChartPreview() {
-    val tables = (0..1).map { domain ->
-        fun levels(offsetMv: Int) = (0..4).map { index ->
-            val khz = 600_000 + domain * 500_000 + index * (600_000 + domain * 200_000)
-            val mv = 584 + domain * 40 + index * 72 + offsetMv
-            val power = (100L * khz * mv * mv / 1_000_000_000).toInt()
-            Level(domain, index, khz, power, 100)
-        }
-        VoltageTable(domain, levels(0), levels(24).associateBy(Level::khz))
+private val VoltageClusterSpacing = 6.dp
+private val VoltageCellSpacing = 3.dp
+private val VoltageCellPadding = 7.dp
+
+private enum class VoltageColumn { FREQUENCY, ORIGINAL, CURRENT, DELTA }
+
+private val PrimaryVoltageColumns = listOf(VoltageColumn.FREQUENCY, VoltageColumn.CURRENT)
+private val SecondaryVoltageColumns = listOf(VoltageColumn.ORIGINAL, VoltageColumn.DELTA)
+
+private data class VoltageRowValues(
+    val frequency: String,
+    val current: String,
+    val original: String = "—",
+    val deltaText: String = "—",
+    val delta: Int? = null,
+) {
+    operator fun get(column: VoltageColumn): String = when (column) {
+        VoltageColumn.FREQUENCY -> frequency
+        VoltageColumn.ORIGINAL -> original
+        VoltageColumn.CURRENT -> current
+        VoltageColumn.DELTA -> deltaText
     }
-    TunerTheme { VoltageChartCard(tables, estimated = true, modifier = Modifier.fillMaxWidth()) }
+}
+
+private data class VoltageTableLayout(
+    val domain: Int,
+    val rows: List<VoltageRowValues>,
+    val columnWidths: Map<VoltageColumn, Int>,
+    val fullWidth: Int,
+    val compactWidth: Int,
+) {
+    val fullLines = listOf(columnWidths.keys)
+    val compactLines = if (VoltageColumn.ORIGINAL in columnWidths) {
+        listOf(PrimaryVoltageColumns, SecondaryVoltageColumns)
+    } else fullLines
+}
+
+private fun voltageTableRows(table: VoltageTable, showPower: Boolean): List<VoltageRowValues> = buildList {
+    val heading = when {
+        showPower -> "估算功耗 mW"
+        table.baseline.isNotEmpty() -> "当前"
+        else -> "电压 mV"
+    }
+    add(VoltageRowValues("MHz", heading, "原厂", "ΔmV"))
+    for (level in table.levels) {
+        val current = level.millivolts
+        val original = table.baseline[level.khz]?.millivolts
+        val delta = if (original != null && current != null) current - original else null
+        add(
+            VoltageRowValues(
+                frequency = decimal(level.khz / 1000.0),
+                current = if (showPower) decimal(level.microwatts / 1000.0) else current?.toString() ?: "—",
+                original = original?.toString() ?: "—",
+                deltaText = delta?.let { signed(it.toDouble(), 0) } ?: "—",
+                delta = delta,
+            ),
+        )
+    }
+}
+
+@Composable
+private fun rememberVoltageTableLayouts(tables: List<VoltageTable>, showPower: Boolean): List<VoltageTableLayout> {
+    val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val typography = MaterialTheme.typography
+    return remember(tables, showPower, textMeasurer, density, typography) {
+        val padding = with(density) { 2 * VoltageCellPadding.roundToPx() }
+        val spacing = with(density) { VoltageCellSpacing.roundToPx() }
+        val valueStyle = typography.bodySmall.tabular()
+        val frequencyStyle = valueStyle.copy(fontWeight = FontWeight.SemiBold)
+        fun width(text: String, style: TextStyle): Int =
+            textMeasurer.measure(text, style = style, softWrap = false, maxLines = 1).size.width
+
+        tables.map { table ->
+            val comparison = table.baseline.isNotEmpty()
+            val columns = if (comparison) VoltageColumn.entries else PrimaryVoltageColumns
+            val rows = voltageTableRows(table, showPower)
+            val header = rows.first()
+            val values = rows.subList(1, rows.size)
+            val widths = columns.associateWith { column ->
+                val style = if (column == VoltageColumn.FREQUENCY) frequencyStyle else valueStyle
+                // Unit labels can wrap at spaces when the column is narrow.
+                val headerWidth = header[column].split(' ').maxOf { width(it, typography.labelMedium) }
+                val valueWidth = values.asSequence().map { it[column] }.distinct().maxOf { width(it, style) }
+                maxOf(headerWidth, valueWidth)
+            }
+            fun lineWidth(line: List<VoltageColumn>): Int =
+                line.sumOf { widths.getValue(it) } + (line.size - 1) * spacing + padding
+
+            val titleWidth = width("PDP${table.domain}", typography.titleSmall) + padding
+            val fullWidth = maxOf(titleWidth, lineWidth(columns))
+            val compactWidth = if (comparison) {
+                maxOf(titleWidth, lineWidth(PrimaryVoltageColumns), lineWidth(SecondaryVoltageColumns))
+            } else fullWidth
+            VoltageTableLayout(table.domain, rows, widths, fullWidth, compactWidth)
+        }
+    }
 }
 
 @Composable
 private fun VoltageTableRow(
-    comparison: Boolean,
+    table: VoltageTableLayout,
+    values: VoltageRowValues,
+    row: Int,
+    compact: Boolean,
     modifier: Modifier = Modifier,
-    showPower: Boolean = false,
-    level: Level? = null,
-    original: Int? = null,
-    shapeIndex: Int = 0,
-    shapeCount: Int = 2,
 ) {
-    val current = level?.millivolts
-    val delta = if (original != null && current != null) current - original else null
-    val deltaTone = when {
-        delta == null || delta == 0 -> Tone.NEUTRAL
-        delta < 0 -> Tone.POSITIVE
-        else -> Tone.DANGER
+    val heading = row == 0
+    val colors = MaterialTheme.colorScheme
+    val typography = MaterialTheme.typography
+    val style = if (heading) typography.labelMedium else typography.bodySmall.tabular()
+    val deltaColor = when {
+        values.delta == null -> colors.onSurfaceVariant
+        values.delta < 0 -> toneColors(Tone.POSITIVE).second
+        values.delta > 0 -> toneColors(Tone.DANGER).second
+        else -> toneColors(Tone.NEUTRAL).second
     }
-    val style = if (level == null) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall.tabular()
-    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
-    val deltaColor = if (delta == null) secondary else toneColors(deltaTone).second
-    Surface(
-        modifier.fillMaxWidth(),
-        shape = listSegmentShape(shapeIndex, shapeCount),
-        color = if (level == null) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.surfaceContainerLow,
-    ) {
-        Row(
-            Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(3.dp),
-            verticalAlignment = Alignment.CenterVertically,
+    val lines = if (compact) table.compactLines else table.fullLines
+    Column(modifier) {
+        if (heading) {
+            Text(
+                "PDP${table.domain}",
+                Modifier.padding(horizontal = VoltageCellPadding, vertical = 4.dp),
+                color = voltageClusterColor(table.domain),
+                style = typography.titleSmall,
+            )
+        }
+        Surface(
+            Modifier.fillMaxWidth(),
+            shape = listSegmentShape(row, table.rows.size),
+            color = if (heading) colors.surfaceContainerHigh else colors.surfaceContainerLow,
         ) {
-            Text(level?.let { decimal(it.khz / 1000.0) } ?: "MHz", Modifier.weight(1.3f), style = style,
-                fontWeight = if (level == null) null else FontWeight.SemiBold)
-            if (comparison) {
-                Text(if (level == null) "原厂" else original?.toString() ?: "—", Modifier.weight(.85f),
-                    style = style, textAlign = TextAlign.End, color = secondary)
-            }
-            val value = when {
-                showPower -> level?.let { decimal(it.microwatts / 1000.0) } ?: "估算功耗 mW"
-                level == null -> if (comparison) "当前" else "电压 mV"
-                else -> current?.toString() ?: "—"
-            }
-            Text(value, Modifier.weight(if (showPower) 1.25f else .85f), style = style, textAlign = TextAlign.End)
-            if (comparison) {
-                Text(
-                    if (level == null) "ΔmV" else delta?.let { signed(it.toDouble(), 0) } ?: "—",
-                    modifier = Modifier.weight(.85f),
-                    style = style,
-                    color = deltaColor,
-                    textAlign = TextAlign.End,
-                )
+            Column(Modifier.padding(horizontal = VoltageCellPadding, vertical = 4.dp)) {
+                for (line in lines) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(VoltageCellSpacing),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        for ((index, column) in line.withIndex()) {
+                            Text(
+                                values[column],
+                                modifier = Modifier.weight(table.columnWidths.getValue(column).toFloat()),
+                                style = style,
+                                fontWeight = if (!heading && column == VoltageColumn.FREQUENCY) FontWeight.SemiBold else null,
+                                textAlign = if (index == 0) TextAlign.Start else TextAlign.End,
+                                color = when (column) {
+                                    VoltageColumn.ORIGINAL -> colors.onSurfaceVariant
+                                    VoltageColumn.DELTA -> deltaColor
+                                    else -> Color.Unspecified
+                                },
+                            )
+                        }
+                    }
+                }
             }
         }
     }
